@@ -9,27 +9,19 @@ def act(pi, act_limit, obs, deterministic=False):
     res = pi(obs)
     mu, log_std = torch.chunk(res, 2, dim=-1)
     if not deterministic:
-        # dist = torch.distributions.normal.Normal(mu, torch.exp(log_std))
-        # unsquashed_sample = dist.sample()
-        # sample = torch.tanh(unsquashed_sample)
-        # log_prob = dist.log_prob(unsquashed_sample)
         std = torch.exp(log_std)
         with torch.no_grad():
             unsquashed_sample = torch.normal(mean=mu, std=std)
         log_prob = 0.5 * torch.sum(((unsquashed_sample - mu) / std)**2 + 2 * log_std, dim=-1)
+
+        # from https://github.com/openai/jachiam-sandbox/blob/master/Standalone-RL/myrl/algos/sac_new/sac.py#L51
+        log_prob -= torch.sum(2*(np.log(2) - unsquashed_sample - torch.nn.functional.softplus(-2*unsquashed_sample)), dim=-1)
+
         sample = torch.tanh(unsquashed_sample)
     else:
         sample = np.tanh(mu)
-        log_prob = None  # not used
+        log_prob = torch.tensor(-0.7)  # 50%
     return act_limit * sample, log_prob
-
-
-# def get_log_probs(pi, acts, obs):
-#     res = pi.forward(obs)  # do we really need to recompute this?
-#     mu, log_std = torch.chunk(res, 2)
-#     dist = torch.distributions.normal.Normal(mu, torch.exp(log_std))
-#     samples = -2.0 * torch.cosh(acts)  # inverting tanh
-#     return dist.log_prob(samples)
 
 
 def train(args):
@@ -49,11 +41,12 @@ def train(args):
 
     def curried_act(obs, random=False, deterministic=False):
         if random:
-            return torch.tensor(np.random.uniform(-act_limit, act_limit, act_dim)).float(), None
+            return torch.tensor(np.random.uniform(-act_limit, act_limit, act_dim)).float(), torch.tensor(-0.7)
         return act(pi, act_limit, torch.tensor(obs).float(), deterministic=deterministic)
 
     agent = Agent(args, env, curried_act)
-    log = DataLogger(args.logdir)
+    logfile, paramsfile = get_filenames(args)
+    log = DataLogger(logfile)
 
     start = time.time()
     q_mse_loss = torch.nn.MSELoss()
@@ -66,6 +59,9 @@ def train(args):
         print(f"--------Epoch {epoch}--------")
         step = 0
         epoch_rews = []
+        entropy_bonuses = []
+        if epoch == 2:
+            import ipdb; ipdb.set_trace()
 
         while step < args.steps_per_epoch:
             steps = agent.run_trajectory()
@@ -113,19 +109,26 @@ def train(args):
                     v_targ_state_dict[name] = args.polyak * v_targ_state_dict[name] + (1 - args.polyak) * params
 
                 epoch_rews.append(rews.numpy())
+                entropy_bonuses.append(entropy_bonus.detach().numpy())
 
             ep_rew = np.array(epoch_rews)
+            ep_entropy_bonus = np.array(entropy_bonuses)
             log.log_tabular("ExpName", args.exp_name)
             log.log_tabular("AverageReturn", ep_rew.mean())
             log.log_tabular("StdReturn", ep_rew.std())
             log.log_tabular("MaxReturn", ep_rew.max())
             log.log_tabular("MinReturn", ep_rew.min())
+            log.log_tabular("EntropyBonus", ep_entropy_bonus.mean())
             log.log_tabular("Time", time.time() - start)
-            log.log_tabular("Steps", step * (1 + epoch))
+            log.log_tabular("Steps", epoch * args.steps_per_epoch + step)
             log.log_tabular("Epoch", epoch)
+            # log out entropy
+            # plot out action values
+            # not working? bump up batch size
+            # nuts and bolts talk
             log.dump_tabular()
 
-    pi.save(args.paramsdir)
+    torch.save(pi, paramsfile)
     agent.done()
 
 
@@ -136,7 +139,8 @@ def test(args):
     act_limit = env.action_space.high[0]
     pi = Net(obs_dim, act_dim * 2)  ## mean and std output
     pi.eval()
-    torch.load(args.paramsdir)
+    _, paramsfile = get_filenames(args)
+    torch.load(paramsfile)
     def curried_act(obs, random=False, deterministic=True):
         return act(pi, act_limit, torch.tensor(obs).float(), deterministic=True)
     agent = Agent(args, env, curried_act)
@@ -157,10 +161,7 @@ def main():
     if args.test:
         test(args)
     else:
-        if not args.logdir:
-            print("ERROR! Must have logdir specified")
-        else:
-            train(args)
+        train(args)
 
 
 if __name__ == "__main__":

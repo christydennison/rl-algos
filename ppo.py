@@ -23,13 +23,15 @@ def act(pi, act_limit, obs, deterministic=False):
 def cumulative_sum(data, discount):
     longest_T = len(max(data, key=len))
     discounts = torch.tensor([discount**i for i in range(longest_T)])
-    discounted = []
+    traj_discounted = []
     for datum in data:
+        discounted = []
         for t in range(len(datum)):
             to_end = datum[t:]
             discount_slice = discounts[:len(to_end)]
             discounted.append(torch.sum(discount_slice * to_end))
-    return torch.tensor(discounted)
+        traj_discounted.append(discounted)
+    return torch.tensor(traj_discounted)
 
 
 def reward_to_go(args, rewards):
@@ -63,7 +65,8 @@ def train(args):
         return act(pi, act_limit, torch.tensor(obs).float(), deterministic=deterministic)
 
     agent = Agent(args, env, curried_act)
-    log = DataLogger(args.logdir)
+    logfile, paramsfile = get_filenames(args)
+    log = DataLogger(logfile)
 
     start = time.time()
     v_mse_loss = torch.nn.MSELoss()
@@ -82,6 +85,7 @@ def train(args):
             trajectories.append(agent.replay_buffer.get())
             agent.replay_buffer.clear()
 
+        pi_current_params = pi.state_dict()
         for _ in range(args.train_iters):
             obs = torch.cat([traj[0] for traj in trajectories])
             obs_sp = torch.cat([traj[1] for traj in trajectories])
@@ -118,6 +122,9 @@ def train(args):
 
             epoch_rews.append(rewards.numpy())
 
+        # set to last pi's params
+        pi_prev.load_state_dict(pi_current_params)
+
         ep_rew = np.array(epoch_rews)
         log.log_tabular("ExpName", args.exp_name)
         log.log_tabular("AverageReturn", ep_rew.mean())
@@ -129,7 +136,7 @@ def train(args):
         log.log_tabular("Epoch", epoch)
         log.dump_tabular()
 
-    torch.save(pi, args.paramsdir)
+    torch.save(pi, paramsfile)
     agent.done()
 
 
@@ -140,7 +147,8 @@ def test(args):
     act_limit = env.action_space.high[0]
     pi = Net(obs_dim, act_dim * 2)  ## mean and std output
     pi.eval()
-    torch.load(args.paramsdir)
+    _, paramsfile = get_filenames(args)
+    torch.load(paramsfile)
     def curried_act(obs, random=False, deterministic=True):
         return act(pi, act_limit, torch.tensor(obs).float(), deterministic=True)
     agent = Agent(args, env, curried_act)
@@ -165,10 +173,7 @@ def main():
     if args.test:
         test(args)
     else:
-        if not args.logdir:
-            print("ERROR! Must have logdir specified")
-        else:
-            train(args)
+        train(args)
 
 
 if __name__ == "__main__":

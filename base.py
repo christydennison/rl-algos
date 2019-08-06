@@ -5,6 +5,7 @@ import os
 import collections
 import random
 import numpy as np
+import mujoco_py
 
 
 Transition = collections.namedtuple("Transition", ["old_obs", "new_obs", "action", "reward", "done", "log_prob"])
@@ -44,11 +45,7 @@ class Net(torch.nn.Module):
         self.load_state_dict(model.get_params())
         self.eval()
 
-    # def save(self, path):
-    #     torch.save(self.state_dict(), path)
-
     def forward(self, *inp):
-        # [i.float() for i in inp]
         return self.seq(*inp)
 
 
@@ -72,7 +69,7 @@ class ReplayBuffer():
             acts.append(transition.action.unsqueeze(0))
             rews.append(torch.tensor(transition.reward))
             dones.append(torch.tensor(transition.done))
-            log_probs.append(torch.tensor(transition.log_prob).unsqueeze(0))
+            log_probs.append(transition.log_prob.detach().unsqueeze(0))
         return torch.cat(old_obs).float(), torch.cat(new_obs).float(), torch.cat(acts).float(), torch.tensor(rews).unsqueeze(1).float(), torch.tensor(dones).unsqueeze(1), torch.cat(log_probs).float()
 
     def sample(self, batch_size):
@@ -102,7 +99,7 @@ class Agent():
         self.max_ep_len = self.args.steps_per_epoch or self.env.spec.max_episode_steps
         print("Max Episode Length", self.max_ep_len)
         self.replay_buffer = ReplayBuffer(maxsize=args.replay_size)
-        self.started = False
+        self.started = False  # this only flips once per lifetime of Agent
 
     def get_env_dims(self):
         return self.env.observation_space.shape[0], self.env.action_space.shape[0]
@@ -114,7 +111,10 @@ class Agent():
         while not(done or steps >= self.max_ep_len):
             action, log_prob = self.act_fn(old_obs, random=not self.started and self.args.start_steps > steps)
 
-            new_obs, reward, done, _ = self.env.step(action.detach().numpy())
+            try:
+                new_obs, reward, done, _ = self.env.step(action.detach().numpy())
+            except mujoco_py.builder.MujocoException:
+                break
 
             self.replay_buffer.add(Transition(old_obs, new_obs, action, reward, done, log_prob))
             steps += 1
@@ -130,6 +130,7 @@ class Agent():
         return steps
 
     def test(self, steps=1000):
+        self.env = gym.wrappers.Monitor(self.env, self.args.dir, force=True)
         observation = self.env.reset()
         total_reward = 0
         for _ in range(steps):
@@ -186,14 +187,19 @@ def train_base(args):
     return env, act_limit, obs_dim, act_dim
 
 
+def get_filenames(args):
+    logdir = os.path.join(args.dir, args.exp_name + "_data.csv")
+    paramsdir = os.path.join(args.dir, args.exp_name + "_params.mdl")
+    return logdir, paramsdir
+
+
 def base_argparser(*moreargs):
     import argparse
 
     parser = argparse.ArgumentParser()
     parser.add_argument("env_name", type=str)
     parser.add_argument("--exp_name", type=str)
-    parser.add_argument("--logdir", type=str, default=None)
-    parser.add_argument("--paramsdir", type=str)
+    parser.add_argument("--dir", type=str, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--steps_per_epoch", type=int, default=5000)
@@ -205,6 +211,4 @@ def base_argparser(*moreargs):
     parser.add_argument("--start_steps", type=int, default=0)
     parser.add_argument("--test", action="store_true")
 
-
     return parser
-
