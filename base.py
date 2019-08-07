@@ -66,10 +66,10 @@ class ReplayBuffer():
         for transition in transitions:
             old_obs.append(torch.tensor(transition.old_obs).unsqueeze(0))
             new_obs.append(torch.tensor(transition.new_obs).unsqueeze(0))
-            acts.append(transition.action.unsqueeze(0))
+            acts.append(torch.tensor(transition.action).unsqueeze(0))
             rews.append(torch.tensor(transition.reward))
             dones.append(torch.tensor(transition.done))
-            log_probs.append(transition.log_prob.detach().unsqueeze(0))
+            log_probs.append(torch.tensor(transition.log_prob).unsqueeze(0))
         return torch.cat(old_obs).float(), torch.cat(new_obs).float(), torch.cat(acts).float(), torch.tensor(rews).unsqueeze(1).float(), torch.tensor(dones).unsqueeze(1), torch.cat(log_probs).float()
 
     def sample(self, batch_size):
@@ -109,14 +109,15 @@ class Agent():
         old_obs = self.env.reset()
         steps = 0
         while not(done or steps >= self.max_ep_len):
-            action, log_prob = self.act_fn(old_obs, random=not self.started and self.args.start_steps > steps)
+            action, log_prob, _, _ = self.act_fn(old_obs, random=not self.started and self.args.start_steps > steps)
+            action_detached = action.detach().numpy()
 
             try:
-                new_obs, reward, done, _ = self.env.step(action.detach().numpy())
+                new_obs, reward, done, _ = self.env.step(action_detached)
             except mujoco_py.builder.MujocoException:
                 break
 
-            self.replay_buffer.add(Transition(old_obs, new_obs, action, reward, done, log_prob))
+            self.replay_buffer.add(Transition(old_obs, new_obs, action_detached, reward, done, log_prob.detach().numpy()))
             steps += 1
 
         self.started = True
@@ -137,7 +138,7 @@ class Agent():
             self.env.render()
 
             with torch.no_grad():
-                action, _ = self.act_fn(observation, random=False, deterministic=True)
+                action, _, _, _ = self.act_fn(observation, random=False, deterministic=True)
 
             observation, reward, done, _ = self.env.step(action.detach().numpy())
             total_reward += reward
@@ -151,18 +152,24 @@ class Agent():
 
 
 class DataLogger():
-    def __init__(self, filename):
+    def __init__(self, filename, args):
         self.filename = filename
         self.unsaved = {}
         self.use_headers = True
-        self.index_key = "Epoch"
+        self.index_key = 'Epoch'
+        self.args = args
+        self.print_count = 0
 
     def log_tabular(self, key, val):
         self.unsaved[key] = [val]
 
     def dump_tabular(self):
         df = pd.DataFrame(self.unsaved, index=self.unsaved[self.index_key])
-        print(df)
+        if self.print_count % 10 == 0:
+            print(df.round(3))
+            self.print_count += 1
+        else:
+            print(df.round(3).to_string().split("\n")[1])
         df.to_csv(self.filename, sep='\t', mode='a', header=self.use_headers)
         self.unsaved = {}
         self.use_headers = False
@@ -188,12 +195,23 @@ def train_base(args):
 
 
 def get_filenames(args):
-    logdir = os.path.join(args.dir, args.exp_name + "_data.csv")
-    paramsdir = os.path.join(args.dir, args.exp_name + "_params.mdl")
-    return logdir, paramsdir
+    logfile = os.path.join(args.dir, args.exp_name + "_data.csv")
+    paramsfile = os.path.join(args.dir, args.exp_name + "_params.mdl")
+    if args.clear:
+        if os.path.exists(logfile):
+            os.remove(logfile)
+        if os.path.exists(paramsfile):
+            os.remove(paramsfile)
+    return logfile, paramsfile
 
 
-def base_argparser(*moreargs):
+def scale_hypers(args):
+    args.max_ep_len = int(args.max_ep_len * args.scale_hypers)
+    args.batch_size = int(args.batch_size * args.scale_hypers)
+    args.steps_per_epoch = int(args.steps_per_epoch * args.scale_hypers)
+    args.epochs = int(args.epochs * args.scale_hypers)
+
+def base_argparser():
     import argparse
 
     parser = argparse.ArgumentParser()
@@ -207,8 +225,10 @@ def base_argparser(*moreargs):
     parser.add_argument("--batch_size", type=int, default=100)
     parser.add_argument("--replay_size", type=int, default=int(1e6))
     parser.add_argument("--lr", type=float, default=0.001)
-    parser.add_argument("--gamma", type=int, default=0.99)
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--scale_hypers", type=float, default=1.0)
     parser.add_argument("--start_steps", type=int, default=0)
     parser.add_argument("--test", action="store_true")
+    parser.add_argument("--clear", action="store_true", help="clear out previous logs")
 
     return parser
