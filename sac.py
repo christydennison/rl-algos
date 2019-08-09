@@ -7,56 +7,61 @@ from base import *
 
 LOG_STD_MAX = 2
 LOG_STD_MIN = -20
+LOG_PROB_CONST = np.log(2 * np.pi)
+LOG_PROB_CONST2 = np.log(2)
 
-def act(pi, act_limit, obs, act_dim, deterministic=False):
+
+
+def act(pi, act_limit, obs, deterministic=False):
     res = pi(obs)
     mu, log_std = torch.chunk(res, 2, dim=-1)
     log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
     if not deterministic:
         std = torch.exp(log_std)
         normal_noise = torch.randn_like(mu)
+        mu.register_hook(lambda grad: print("mu", grad))
+        log_std.register_hook(lambda grad: print("log_std", grad))
         unsquashed_sample = mu + normal_noise * std
-        log_prob = -0.5 * (normal_noise**2 + 2 * log_std)
+        unsquashed_sample.register_hook(lambda grad: print("unsquashed_sample", grad))
+        sample = torch.tanh(unsquashed_sample)
+
+        log_prob = torch.sum(-0.5 * (normal_noise**2 + 2 * log_std + LOG_PROB_CONST), dim=-1)
 
         # from https://github.com/openai/jachiam-sandbox/blob/master/Standalone-RL/myrl/algos/sac_new/sac.py#L51
-        log_prob -= 2*(np.log(2) - unsquashed_sample - torch.nn.functional.softplus(-2 * unsquashed_sample))
+        log_prob -= torch.sum(2 * (LOG_PROB_CONST2 - unsquashed_sample - torch.nn.functional.softplus(-2 * unsquashed_sample)), dim=-1)
+        # log_prob -= torch.sum(torch.log(1 - sample**2), dim=-1)
+        log_prob = log_prob.unsqueeze(-1)
+        log_prob.register_hook(lambda grad: print("log_prob", grad))
 
-        sample = torch.tanh(unsquashed_sample)
+        sample.register_hook(lambda grad: print("sample", grad))
     else:
         sample = np.tanh(mu)
-        log_prob = torch.tensor([0.0] * act_dim).float()  # 50%
+        log_prob = torch.tensor([0.0]).float()  # 50%
     return act_limit * sample, log_prob, torch.tanh(mu), torch.tanh(log_std)
 
 
 def train(args):
-    env, act_limit, obs_dim, act_dim = train_base(args)
+    env, test_env, act_limit, obs_dim, act_dim = train_base(args)
 
-    q0 = Net(obs_dim + act_dim, 1)
-    q1 = Net(obs_dim + act_dim, 1)
-    v = Net(obs_dim, 1)
-    v_targ = Net(obs_dim, 1)
-    v_targ.load_from_model(v)
-    pi = Net(obs_dim, act_dim * 2)  ## mean and std output
-    q0.eval()
-    q1.eval()
-    v.eval()
-    v_targ.eval()
-    pi.eval()
+    q0 = Net(obs_dim + act_dim, [1])
+    q1 = Net(obs_dim + act_dim, [1])
+    v = Net(obs_dim, [1])
+    v_targ = Net(obs_dim, [1])
+    v_targ.load_state_dict(v.state_dict())
+    pi = Net(obs_dim, [act_dim, act_dim])  ## mean and std output
+    v_targ.eval()  # don't save gradients for targ
 
     def curried_act(obs, random=False, deterministic=False):
         if random:
-            return torch.tensor(np.random.uniform(-act_limit, act_limit, act_dim)).float(), torch.tensor([0.0] * act_dim).float(), torch.tensor(0).float(), torch.tensor(0).float()
-        return act(pi, act_limit, torch.tensor(obs).float(), act_dim=act_dim, deterministic=deterministic)
+            return torch.tensor(np.random.uniform(-act_limit, act_limit, act_dim)).float(), torch.tensor(0.0).float(), torch.tensor(0).float(), torch.tensor(0).float()
+        return act(pi, act_limit, torch.tensor(obs).float(), deterministic=deterministic)
 
-    agent = Agent(args, env, curried_act)
+    agent = Agent(args, env, test_env, curried_act)
     logfile, paramsfile = get_filenames(args)
     log = DataLogger(logfile, args)
 
     start = time.time()
-    q_mse_loss = torch.nn.MSELoss()
-    v_mse_loss = torch.nn.MSELoss()
-    q_optimizer = torch.optim.Adam(list(q0.parameters()) + list(q1.parameters()), lr=args.lr)
-    v_optimizer = torch.optim.Adam(v.parameters(), lr=args.lr)
+    qv_optimizer = torch.optim.Adam(list(q0.parameters()) + list(q1.parameters()) + list(v.parameters()), lr=args.lr)
     pi_optimizer = torch.optim.Adam(pi.parameters(), lr=args.lr)
 
     for epoch in range(args.epochs):
@@ -64,19 +69,24 @@ def train(args):
         step = 0
         epoch_rews = []
         entropy_bonuses = []
-        entropy = []
+        # entropy = []
         pi_losses = []
         q0_losses = []
         q1_losses = []
         v_losses = []
         act_mean = []
+        ep_lens = []
+        step_ranges = []
 
         while step < args.steps_per_epoch:
-            steps = agent.run_trajectory()
-            step += steps
+            traj_steps, ep_rew = agent.run_trajectory()
+            epoch_rews.append(ep_rew)
+            ep_lens.append(traj_steps)
+            step += traj_steps
 
             for _ in range(args.max_ep_len):
-                old_obs, new_obs, acts, rews, dones, _ = agent.replay_buffer.sample(args.batch_size)
+                old_obs, new_obs, acts, rews, dones, _, steps_for_sample = agent.replay_buffer.sample(args.batch_size)
+                step_ranges.append(steps_for_sample)
 
                 old_obs_acts = torch.cat([old_obs, acts], dim=1)
                 neg_done_floats = (1 - dones).float()
@@ -84,78 +94,89 @@ def train(args):
                 q1_res = q1(old_obs_acts)
                 v_targ_res = v_targ(new_obs)
                 v_res = v(old_obs)
+                q0_res.register_hook(lambda grad: print("q0_res", grad))
+                q1_res.register_hook(lambda grad: print("q1_res", grad))
+                v_targ_res.register_hook(lambda grad: print("v_targ_res", grad))
+                v_res.register_hook(lambda grad: print("v_res", grad))
 
-                fresh_acts, log_probs, _, log_stds = act(pi, act_limit, old_obs, act_dim=act_dim)  # fresh
+                fresh_acts, log_probs, _, _ = act(pi, act_limit, old_obs)  # fresh
                 obs_acts_fresh = torch.cat([old_obs, fresh_acts], dim=1)
-                entropy_bonus = torch.sum(args.alpha * log_probs, dim=-1).unsqueeze(1)
+                q0_fresh_res = q0(obs_acts_fresh)
+                q0_fresh_res.register_hook(lambda grad: print("q0_fresh_res", grad))
+                entropy_bonus = args.alpha * log_probs
+                entropy_bonus.register_hook(lambda grad: print("entropy_bonus", grad))
 
                 with torch.no_grad():
                     q_target = rews + args.gamma * neg_done_floats * v_targ_res
                     v_target = torch.min(q0_res, q1_res) - entropy_bonus
-                    q0_fresh_res = q0(obs_acts_fresh)
 
-                b_inv = 1.0/args.batch_size
-                q0_loss = b_inv * torch.sum((q0_res - q_target)**2) #q_mse_loss(q0_res, q_target)
-                q1_loss = b_inv * torch.sum((q1_res - q_target)**2) # q_mse_loss(q1_res, q_target)
+                q0_loss = torch.mean((q0_res - q_target)**2) #q_mse_loss(q0_res, q_target)
+                q1_loss = torch.mean((q1_res - q_target)**2) # q_mse_loss(q1_res, q_target)
                 q_loss = q0_loss + q1_loss
-                v_loss = b_inv * torch.sum((v_res - v_target)**2) # v_mse_loss(v_res, v_target)
-                pi_loss = -b_inv * torch.sum(q0_fresh_res - entropy_bonus)  # gradient ascent -> descent
+                v_loss = torch.mean((v_res - v_target)**2) # v_mse_loss(v_res, v_target)
+                qv_loss = q_loss + v_loss
+                qv_loss.register_hook(lambda grad: print("qv_loss", grad))
+                pi_loss = -torch.mean(q0_fresh_res - entropy_bonus)  # gradient ascent -> descent
+                pi_loss.register_hook(lambda grad: print("pi_loss", grad))
 
-                q_optimizer.zero_grad()
-                v_optimizer.zero_grad()
+                pi_optimizer.zero_grad()
+                pi_loss.backward()
+                pi_optimizer.step()
                 pi_optimizer.zero_grad()
 
-                q_loss.backward()
-                v_loss.backward()
-                pi_loss.backward()
-
-                q_optimizer.step()
-                v_optimizer.step()
-                pi_optimizer.step()
+                qv_optimizer.zero_grad()
+                qv_loss.backward()
+                qv_optimizer.step()
+                qv_optimizer.zero_grad()
 
                 v_targ_state_dict = v_targ.state_dict()
                 for name, params in v.state_dict().items():
                     v_targ_state_dict[name] = args.polyak * v_targ_state_dict[name] + (1 - args.polyak) * params
 
-                epoch_rews.append(np.sum(rews.numpy()))
                 entropy_bonuses.append(entropy_bonus.detach().numpy())
                 # entropy.append(torch.mean(torch.sum(torch.exp(log_probs) * log_probs, dim=-1)).detach().numpy())
-                entropy.append(torch.sum(log_stds, dim=-1).detach().numpy())
-                pi_losses.append(pi_loss.detach().item())
-                q0_losses.append(q0_loss.detach().item())
-                q1_losses.append(q1_loss.detach().item())
-                v_losses.append(v_loss.detach().item())
-                act_mean.append(torch.sum(torch.mean(acts, dim=0)))
+                # entropy.append(torch.sum(log_stds, dim=-1).item())
+                pi_losses.append(pi_loss.item())
+                q0_losses.append(q0_loss.item())
+                q1_losses.append(q1_loss.item())
+                v_losses.append(v_loss.item())
+                act_mean.append(torch.sum(torch.mean(act_limit - torch.abs(acts), dim=0)))  # how close to the edges of the act limit are the actions
 
-            ep_rew = np.array(epoch_rews)
-            ep_entropy_bonus = np.array(entropy_bonuses)
-            ep_entropy = np.array(entropy)
-            ep_pi_losses = np.array(pi_losses)
-            ep_q0_losses = np.array(q0_losses)
-            ep_q1_losses = np.array(q1_losses)
-            ep_v_losses = np.array(v_losses)
-            ep_act_mean = np.array(act_mean)
+        ep_rew = np.array(epoch_rews)
+        ep_entropy_bonus = np.array(entropy_bonuses)
+        # ep_entropy = np.array(entropy)
+        ep_pi_losses = np.array(pi_losses)
+        ep_q0_losses = np.array(q0_losses)
+        ep_q1_losses = np.array(q1_losses)
+        ep_v_losses = np.array(v_losses)
+        ep_act_mean = np.array(act_mean)
+        ep_lens_mean = np.array(ep_lens)
+        ep_step_ranges = np.array(step_ranges)
 
-            log.log_tabular("ExpName", args.exp_name)
-            log.log_tabular("AverageReturn", ep_rew.mean())
-            log.log_tabular("StdReturn", ep_rew.std())
-            log.log_tabular("MaxReturn", ep_rew.max())
-            log.log_tabular("MinReturn", ep_rew.min())
-            log.log_tabular("EntropyBonus", ep_entropy_bonus.mean())
-            log.log_tabular("Entropy", ep_entropy.mean())
-            log.log_tabular("PiLoss", ep_pi_losses.mean())
-            log.log_tabular("Q0Loss", ep_q0_losses.mean())
-            log.log_tabular("Q1Loss", ep_q1_losses.mean())
-            log.log_tabular("VLoss", ep_v_losses.mean())
-            log.log_tabular("ActMean", ep_act_mean.mean())
-            log.log_tabular("Time", time.time() - start)
-            log.log_tabular("Steps", epoch * args.steps_per_epoch + step)
-            log.log_tabular("Epoch", epoch)
-            # log out entropy
-            # plot out action values
-            # not working? bump up batch size
-            # nuts and bolts talk
-            log.dump_tabular()
+        test_ep_len, test_ep_rew = agent.test(render=False)
+
+        log.log_tabular("ExpName", args.exp_name)
+        log.log_tabular("AverageReturn", ep_rew.mean())
+        log.log_tabular("TestReturn", test_ep_rew)
+        log.log_tabular("MaxReturn", ep_rew.max())
+        log.log_tabular("MinReturn", ep_rew.min())
+        log.log_tabular("StdReturn", ep_rew.std())
+        log.log_tabular("AverageEpLen", ep_lens_mean.mean())
+        log.log_tabular("TestEpLen", test_ep_len)
+        log.log_tabular("EntropyBonus", ep_entropy_bonus.mean())
+        # log.log_tabular("Entropy", ep_entropy.mean())
+        log.log_tabular("PiLoss", ep_pi_losses.mean())
+        log.log_tabular("Q0Loss", ep_q0_losses.mean())
+        log.log_tabular("Q1Loss", ep_q1_losses.mean())
+        log.log_tabular("VLoss", ep_v_losses.mean())
+        # log.log_tabular("ActMean", ep_act_mean.mean())
+        log.log_tabular("Time", time.time() - start)
+        log.log_tabular("StepRangeMin", ep_step_ranges.min())
+        log.log_tabular("StepRangeMax", ep_step_ranges.max())
+        log.log_tabular("Steps", epoch * args.steps_per_epoch + step)
+        log.log_tabular("Epoch", epoch)
+        # plot out action values
+        log.dump_tabular()
 
         # save params at end of epoch
         torch.save(pi, paramsfile)
@@ -164,17 +185,18 @@ def train(args):
 
 def test(args):
     env = gym.make(args.env_name)
+    test_env = gym.make(args.env_name)
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
     act_limit = env.action_space.high[0]
-    pi = Net(obs_dim, act_dim * 2)  ## mean and std output
+    pi = Net(obs_dim, [act_dim, act_dim])  ## mean and std output
     pi.eval()
     _, paramsfile = get_filenames(args)
     torch.load(paramsfile)
-    def curried_act(obs, _, deterministic):
-        return act(pi, act_limit, torch.tensor(obs).float(), act_dim, deterministic)
-    agent = Agent(args, env, curried_act)
-    agent.test(steps=2000)
+    def curried_act(obs, random, deterministic):
+        return act(pi, act_limit, torch.tensor(obs).float(), deterministic)
+    agent = Agent(args, env, test_env, curried_act)
+    agent.test(render=True)
 
 
 def main():
@@ -186,6 +208,7 @@ def main():
     parser = base_argparser()
     parser.add_argument("--polyak", type=float, default=0.995)
     parser.add_argument("--alpha", type=float, default=0.2)
+    parser.add_argument("--start_steps", type=int, default=10000)
     args = parser.parse_args()
     scale_hypers(args)
 
