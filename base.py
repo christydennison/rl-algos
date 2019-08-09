@@ -8,8 +8,11 @@ import numpy as np
 import mujoco_py
 
 
-Transition = collections.namedtuple("Transition", ["old_obs", "new_obs", "action", "reward", "done", "log_prob", "step"])
+LOG_STD_MAX = 2
+LOG_STD_MIN = -20
+LOG_PROB_CONST = np.log(2 * np.pi)
 
+Transition = collections.namedtuple("Transition", ["old_obs", "new_obs", "action", "reward", "done", "log_prob", "step"])
 
 dtype = torch.float
 
@@ -155,6 +158,7 @@ class Agent():
                 new_obs, reward, done, _ = self.env.step(action_detached)
             except mujoco_py.builder.MujocoException:
                 print(f"Exception when trying to step at step {steps} with done signal {done}")
+            done = False if steps == self.max_ep_len else done
 
             self.replay_buffer.add(Transition(old_obs, new_obs, action_detached, reward, done, log_prob.item(), self.total_steps))
             steps += 1
@@ -278,6 +282,8 @@ def base_argparser():
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--scale_hypers", type=float, default=1.0)
+    parser.add_argument("--test_iters", type=int, default=3)
+    parser.add_argument("--start_steps", type=int, default=10000)
     parser.add_argument("--test", action="store_true")
     parser.add_argument("--clear", action="store_true", help="clear out previous logs")
 

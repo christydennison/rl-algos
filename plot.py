@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 from base import DataLogger
 
 def plot(args):
-    data = [DataLogger(filename).get_data() for filename in args.filenames]
+    data = [DataLogger(filename, args).get_data() for filename in args.filenames]
     data = pd.concat(data, ignore_index=True)
     sns.set(style="darkgrid")
     sns.relplot(x="Steps", y=args.key, kind="line", hue="ExpName", data=data)
@@ -18,6 +18,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--filenames", nargs='*')
     parser.add_argument("--key", type=str, default="AverageReturn")
-    args = parser.parse_args()
+    parsed_args = parser.parse_args()
 
-    plot(args)
+    plot(parsed_args)

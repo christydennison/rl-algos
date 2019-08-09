@@ -8,16 +8,16 @@ from base import *
 def act(pi, act_limit, obs, deterministic=False):
     res = pi(obs)
     mu, log_std = torch.chunk(res, 2, dim=-1)
+    log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
     if not deterministic:
         std = torch.exp(log_std)
-        with torch.no_grad():
-            unsquashed_sample = torch.normal(mean=mu, std=std)
-        log_prob = 0.5 * torch.sum(((unsquashed_sample - mu) / std)**2 + 2 * log_std, dim=-1)
-        sample = unsquashed_sample
+        normal_noise = torch.randn_like(mu)
+        sample = mu + normal_noise * std
+        log_prob = -0.5 * torch.sum(((sample - mu)/(std + 1e-8))**2 + 2 * log_std + LOG_PROB_CONST, dim=-1).unsqueeze(-1)
     else:
-        sample = np.tanh(mu)
-        log_prob = -0.7  # not used, 50%
-    return act_limit * sample, log_prob
+        sample = mu
+        log_prob = torch.tensor([0.0]).float()  # 50%
+    return act_limit * sample, log_prob, mu, log_std
 
 
 def cumulative_sum(data, discount):
@@ -48,25 +48,22 @@ def compute_advantage(args, v_s_res, v_sp_res, rewards):
 
 
 def train(args):
-    env, act_limit, obs_dim, act_dim = train_base(args)
+    env, test_env, act_limit, obs_dim, act_dim = train_base(args)
 
-    v = Net(obs_dim, 1)
-    pi = Net(obs_dim, act_dim * 2)
-    pi_prev = Net(obs_dim, act_dim * 2)
-    pi_prev.load_from_model(pi)
-    pi = Net(obs_dim, act_dim * 2)  ## mean and std output
-    v.eval()
-    pi.eval()
+    v = Net(obs_dim, [1])
+    pi = Net(obs_dim, [act_dim, act_dim])
+    pi_prev = Net(obs_dim, [act_dim, act_dim])
+    pi_prev.load_state_dict(pi.state_dict())
     pi_prev.eval()
 
     def curried_act(obs, random=False, deterministic=False):
         if random:
-            return torch.tensor(np.random.uniform(-act_limit, act_limit, act_dim)).float(), None
+            return torch.tensor(np.random.uniform(-act_limit, act_limit, act_dim)).float(), torch.tensor(0.0).float(), torch.tensor(0).float(), torch.tensor(0).float()
         return act(pi, act_limit, torch.tensor(obs).float(), deterministic=deterministic)
 
-    agent = Agent(args, env, curried_act)
+    agent = Agent(args, env, test_env, curried_act)
     logfile, paramsfile = get_filenames(args)
-    log = DataLogger(logfile)
+    log = DataLogger(logfile, args)
 
     start = time.time()
     v_mse_loss = torch.nn.MSELoss()
@@ -78,20 +75,29 @@ def train(args):
         step = 0
         epoch_rews = []
         trajectories = []
+        pi_losses = []
+        v_losses = []
+        act_mean = []
+        ep_lens = []
+        step_ranges = []
 
         while step < args.steps_per_epoch:
-            steps = agent.run_trajectory()
-            step += steps
-            trajectories.append(agent.replay_buffer.get())
-            agent.replay_buffer.clear()
+            traj_steps, ep_rew = agent.run_trajectory()
+            epoch_rews.append(ep_rew)
+            ep_lens.append(traj_steps)
+            step += traj_steps
 
-        pi_current_params = pi.state_dict()
+        trajectories.append(agent.replay_buffer.get())
+        agent.replay_buffer.clear()
+        import ipdb; ipdb.set_trace()
+
+        last_pi_params = pi.state_dict()
+        obs = torch.cat([traj[0] for traj in trajectories])
+        obs_sp = torch.cat([traj[1] for traj in trajectories])
+        log_probs = torch.cat([traj[5] for traj in trajectories])
+        rewards = torch.cat([traj[3] for traj in trajectories])
+
         for _ in range(args.train_iters):
-            obs = torch.cat([traj[0] for traj in trajectories])
-            obs_sp = torch.cat([traj[1] for traj in trajectories])
-            log_probs = torch.cat([traj[5] for traj in trajectories])
-            rewards = torch.cat([traj[3] for traj in trajectories])
-
             v_s_res = v(obs)
             v_sp_res = v(obs_sp)
             pi_prev_log_probs = act(pi_prev, act_limit, obs)[1]
@@ -111,48 +117,65 @@ def train(args):
             v_loss = v_mse_loss(v_s_res, rtg)
 
             v_optimizer.zero_grad()
-            pi_optimizer.zero_grad()
-
             v_loss.backward()
-            pi_loss.backward()
-
             v_optimizer.step()
+
+            pi_optimizer.zero_grad()
+            pi_loss.backward()
             pi_optimizer.step()
 
-
-            epoch_rews.append(rewards.numpy())
+            pi_losses.append(pi_loss.clone().detach())
+            v_losses.append(v_loss.clone().detach())
 
         # set to last pi's params
-        pi_prev.load_state_dict(pi_current_params)
+        pi_prev.load_state_dict(last_pi_params)
 
         ep_rew = np.array(epoch_rews)
+        ep_pi_losses = np.array(pi_losses)
+        ep_v_losses = np.array(v_losses)
+        ep_lens_mean = np.array(ep_lens)
+        ep_step_ranges = np.array(step_ranges)
+        ep_lens_test = []
+        ep_rew_test = []
+
+        for _ in range(args.test_iters):
+            test_ep_len, test_ep_rew = agent.test(render=False)
+            ep_lens_test.append(test_ep_len)
+            ep_rew_test.append(test_ep_rew)
+
         log.log_tabular("ExpName", args.exp_name)
         log.log_tabular("AverageReturn", ep_rew.mean())
-        log.log_tabular("StdReturn", ep_rew.std())
+        log.log_tabular("TestReturn", np.array(ep_rew_test).mean())
         log.log_tabular("MaxReturn", ep_rew.max())
         log.log_tabular("MinReturn", ep_rew.min())
+        log.log_tabular("StdReturn", ep_rew.std())
+        log.log_tabular("AverageEpLen", ep_lens_mean.mean())
+        log.log_tabular("TestEpLen", np.array(ep_lens_test).mean())
+        log.log_tabular("PiLoss", ep_pi_losses.mean())
+        log.log_tabular("VLoss", ep_v_losses.mean())
         log.log_tabular("Time", time.time() - start)
         log.log_tabular("Steps", step * (1 + epoch))
         log.log_tabular("Epoch", epoch)
         log.dump_tabular()
 
-    torch.save(pi, paramsfile)
+        torch.save(pi, paramsfile)
     agent.done()
 
 
 def test(args):
     env = gym.make(args.env_name)
+    test_env = gym.make(args.env_name)
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
     act_limit = env.action_space.high[0]
-    pi = Net(obs_dim, act_dim * 2)  ## mean and std output
+    pi = Net(obs_dim, [act_dim, act_dim])  ## mean and std output
     pi.eval()
     _, paramsfile = get_filenames(args)
     torch.load(paramsfile)
-    def curried_act(obs, random=False, deterministic=True):
+    def curried_act(obs, random, deterministic):
         return act(pi, act_limit, torch.tensor(obs).float(), deterministic=True)
-    agent = Agent(args, env, curried_act)
-    agent.test(steps=2000)
+    agent = Agent(args, env, test_env, curried_act)
+    agent.test(render=True)
 
 
 def main():
@@ -169,6 +192,8 @@ def main():
     parser.add_argument("--lam", type=float, default=0.97)
     parser.add_argument("--target_kl", type=float, default=0.01)
     args = parser.parse_args()
+
+    args.start_steps = 0
 
     if args.test:
         test(args)
