@@ -47,6 +47,10 @@ def compute_advantage(args, v_s_res, v_sp_res, rewards):
     return adv_unit_scaled
 
 
+def kl_divergence(mu_0, mu_1, log_std0, log_std1):
+    return torch.mean(log_std1 - log_std0 + ((mu_0 - mu_1)**2 + log_std0.exp()**2)/(2 * log_std1.exp()**2) - 0.5)
+
+
 def train(args):
     env, test_env, act_limit, obs_dim, act_dim = train_base(args)
 
@@ -54,7 +58,7 @@ def train(args):
     pi = Net(obs_dim, [act_dim, act_dim])
     pi_prev = Net(obs_dim, [act_dim, act_dim])
     pi_prev.load_state_dict(pi.state_dict())
-    pi_prev.eval()
+    # pi_prev.eval()
 
     def curried_act(obs, random=False, deterministic=False):
         if random:
@@ -86,49 +90,73 @@ def train(args):
             epoch_rews.append(ep_rew)
             ep_lens.append(traj_steps)
             step += traj_steps
+            trajectories.append(agent.replay_buffer.get())
+            agent.replay_buffer.clear()
 
-        trajectories.append(agent.replay_buffer.get())
-        agent.replay_buffer.clear()
-        import ipdb; ipdb.set_trace()
-
-        last_pi_params = pi.state_dict()
         obs = torch.cat([traj[0] for traj in trajectories])
         obs_sp = torch.cat([traj[1] for traj in trajectories])
-        log_probs = torch.cat([traj[5] for traj in trajectories])
         rewards = torch.cat([traj[3] for traj in trajectories])
+        log_probs = torch.cat([traj[5] for traj in trajectories])
+        rtg = torch.cat([reward_to_go(args, traj[3]) for traj in trajectories])
 
-        for _ in range(args.train_iters):
-            v_s_res = v(obs)
-            v_sp_res = v(obs_sp)
-            pi_prev_log_probs = act(pi_prev, act_limit, obs)[1]
-            pi_curr_log_probs = log_probs
+        v_s_res = v(obs)
+        v_sp_res = v(obs_sp)
 
-            # pi loss
-            adv = compute_advantage(args, v_s_res, v_sp_res, rewards)
-            g = adv.clone()
-            g[adv >= 0] *= (1 + args.target_kl)
-            g[adv < 0] *= (1 - args.target_kl)
-            ratio = pi_prev_log_probs/pi_curr_log_probs
+        # loop over lengths and slice so we only do 1 FP with v_s/v_sp
+        adv = []
+        traj_index = 0
+        for tau in trajectories:
+            traj_len = len(tau[0])
+            traj_start = traj_index
+            traj_end = traj_index + traj_len
+            adv_tau = compute_advantage(args, v_s_res[traj_start:traj_end], v_sp_res[traj_start:traj_end], rewards[traj_start:traj_end])
+            adv.append(adv_tau)
+            traj_index += traj_len
 
-            pi_loss = -torch.mean(torch.min(adv * ratio, g)) / len(trajectories)  # ascent -> descent
+        adv = torch.cat(adv)
+        g = adv.clone()
+        g[adv >= 0] *= (1 + args.clip_ratio)
+        g[adv < 0] *= (1 - args.clip_ratio)
 
-            # v loss
-            rtg = reward_to_go(args, rewards)
-            v_loss = v_mse_loss(v_s_res, rtg)
+        _, _, pi_prev_mus, pi_prev_log_stds = act(pi_prev, act_limit, obs)
+        pi_prev_log_probs = log_probs
+        import ipdb; ipdb.set_trace()
 
-            v_optimizer.zero_grad()
-            v_loss.backward()
-            v_optimizer.step()
+        for i_train in range(args.train_iters):
+
+            _, pi_curr_log_probs, pi_mus, pi_log_stds = act(pi, act_limit, obs)
+
+            # break early if kl > target_kl
+            with torch.no_grad():
+                kl = kl_divergence(pi_prev_log_stds, pi_log_stds, pi_prev_mus, pi_mus)
+                if kl > args.target_kl:
+                    print(f"Breaking early at optimization step {i_train} with KL div {kl}")
+                    break
+
+            ratio = torch.exp(pi_curr_log_probs - pi_prev_log_probs)
+
+            # train pi with advantages pre-calculated
+            pi_loss = torch.mean(torch.min(adv * ratio, g)) / len(trajectories)  # ascent -> descent
 
             pi_optimizer.zero_grad()
             pi_loss.backward()
             pi_optimizer.step()
 
+
+            # train V with fresh data
+            v_s_res = v(obs)
+            v_loss = v_mse_loss(v_s_res, rtg) / len(trajectories)
+
+            v_optimizer.zero_grad()
+            v_loss.backward()
+            v_optimizer.step()
+
+
             pi_losses.append(pi_loss.clone().detach())
             v_losses.append(v_loss.clone().detach())
 
-        # set to last pi's params
-        pi_prev.load_state_dict(last_pi_params)
+        # set to optimized pi's params at end of optimization
+        pi_prev.load_state_dict(pi.state_dict())
 
         ep_rew = np.array(epoch_rews)
         ep_pi_losses = np.array(pi_losses)
@@ -192,6 +220,7 @@ def main():
     parser.add_argument("--lam", type=float, default=0.97)
     parser.add_argument("--target_kl", type=float, default=0.01)
     args = parser.parse_args()
+    # scale_hypers(args)
 
     args.start_steps = 0
 
