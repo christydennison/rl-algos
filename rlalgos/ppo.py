@@ -12,7 +12,8 @@ def act(pi, act_limit, obs, deterministic=False):
     if not deterministic:
         std = torch.exp(log_std)
         normal_noise = torch.randn_like(mu)
-        sample = mu + normal_noise * std
+        # with torch.no_grad():
+        sample = (mu + normal_noise * std).detach()
         log_prob = -0.5 * torch.sum(((sample - mu)/(std + 1e-8))**2 + 2 * log_std + LOG_PROB_CONST, dim=-1).unsqueeze(-1)
     else:
         sample = mu
@@ -21,17 +22,18 @@ def act(pi, act_limit, obs, deterministic=False):
 
 
 def cumulative_sum(data, discount):
-    longest_T = len(max(data, key=len))
-    discounts = torch.tensor([discount**i for i in range(longest_T)])
+    # longest_T = len(max(data, key=len))
+    # assuming shape [N, 1]
+    discounts = torch.tensor([discount**i for i in range(data.shape[0])])
     traj_discounted = []
-    for datum in data:
-        discounted = []
-        for t in range(len(datum)):
-            to_end = datum[t:]
-            discount_slice = discounts[:len(to_end)]
-            discounted.append(torch.sum(discount_slice * to_end))
-        traj_discounted.append(discounted)
-    return torch.tensor(traj_discounted)
+    # for datum in data:
+    discounted = []
+    for t in range(len(data)):
+        to_end = data[t:]
+        discount_slice = discounts[:len(to_end)]
+        discounted.append(torch.sum(discount_slice * to_end))
+    # traj_discounted.append(discounted)
+    return torch.tensor(discounted).unsqueeze(1)
 
 
 def reward_to_go(args, rewards):
@@ -41,14 +43,17 @@ def reward_to_go(args, rewards):
 def compute_advantage(args, v_s_res, v_sp_res, rewards):
     delta = rewards + args.gamma * v_sp_res - v_s_res
     adv_unscaled = cumulative_sum(delta, args.gamma * args.lam)
-    std = adv_unscaled.std()
-    mu = adv_unscaled.mean()
-    adv_unit_scaled = (adv_unscaled - mu) / (std + 1e-8)
-    return adv_unit_scaled
+    # std = adv_unscaled.std()
+    # mu = adv_unscaled.mean()
+    # adv_unit_scaled = (adv_unscaled - mu) / (std + 1e-8)
+    return adv_unscaled #adv_unit_scaled
 
 
 def kl_divergence(mu_0, mu_1, log_std0, log_std1):
-    return torch.mean(log_std1 - log_std0 + ((mu_0 - mu_1)**2 + log_std0.exp()**2)/(2 * log_std1.exp()**2) - 0.5)
+    # return torch.mean(log_std1 - log_std0 + ((mu_0 - mu_1)**2 + log_std0.exp()**2)/(2 * log_std1.exp()**2) - 0.5)
+    std0 = log_std0.exp()
+    std1 = log_std1.exp()
+    return torch.mean(0.5 * ( log_std1 - log_std0 + ((mu_1 - mu_0)**2 + std0)/(std1 + 1e-8) - 1 ))
 
 
 def train(args):
@@ -58,7 +63,7 @@ def train(args):
     pi = Net(obs_dim, [act_dim, act_dim])
     pi_prev = Net(obs_dim, [act_dim, act_dim])
     pi_prev.load_state_dict(pi.state_dict())
-    # pi_prev.eval()
+    pi_prev.eval()
 
     def curried_act(obs, random=False, deterministic=False):
         if random:
@@ -114,34 +119,40 @@ def train(args):
             traj_index += traj_len
 
         adv = torch.cat(adv)
+        adv_mean = adv.mean()
+        adv_std = adv.std()
+        adv = (adv - adv_mean) / (adv_std + 1e-8)
         g = adv.clone()
         g[adv >= 0] *= (1 + args.clip_ratio)
         g[adv < 0] *= (1 - args.clip_ratio)
 
         _, _, pi_prev_mus, pi_prev_log_stds = act(pi_prev, act_limit, obs)
         pi_prev_log_probs = log_probs
-        import ipdb; ipdb.set_trace()
+
 
         for i_train in range(args.train_iters):
 
-            _, pi_curr_log_probs, pi_mus, pi_log_stds = act(pi, act_limit, obs)
+            _, pi_log_probs, pi_mus, pi_log_stds = act(pi, act_limit, obs)
 
             # break early if kl > target_kl
             with torch.no_grad():
                 kl = kl_divergence(pi_prev_log_stds, pi_log_stds, pi_prev_mus, pi_mus)
-                if kl > args.target_kl:
+                if kl > args.target_kl * 1.5:
                     print(f"Breaking early at optimization step {i_train} with KL div {kl}")
                     break
 
-            ratio = torch.exp(pi_curr_log_probs - pi_prev_log_probs)
-
+            ratio = torch.exp(pi_log_probs - pi_prev_log_probs)
+            
             # train pi with advantages pre-calculated
-            pi_loss = torch.mean(torch.min(adv * ratio, g)) / len(trajectories)  # ascent -> descent
+            pi_loss = -torch.mean(torch.min(adv * ratio, g)) / len(trajectories)  # ascent -> descent
 
             pi_optimizer.zero_grad()
             pi_loss.backward()
             pi_optimizer.step()
+            pi_losses.append(pi_loss.clone().detach())
 
+
+        for i_train in range(args.train_iters):
 
             # train V with fresh data
             v_s_res = v(obs)
@@ -150,9 +161,6 @@ def train(args):
             v_optimizer.zero_grad()
             v_loss.backward()
             v_optimizer.step()
-
-
-            pi_losses.append(pi_loss.clone().detach())
             v_losses.append(v_loss.clone().detach())
 
         # set to optimized pi's params at end of optimization
@@ -179,7 +187,7 @@ def train(args):
         log.log_tabular("StdReturn", ep_rew.std())
         log.log_tabular("AverageEpLen", ep_lens_mean.mean())
         log.log_tabular("TestEpLen", np.array(ep_lens_test).mean())
-        log.log_tabular("PiLoss", ep_pi_losses.mean())
+        log.log_tabular("PiLoss", ep_pi_losses.mean() if len(ep_pi_losses) > 0 else 0)
         log.log_tabular("VLoss", ep_v_losses.mean())
         log.log_tabular("Time", time.time() - start)
         log.log_tabular("Steps", step * (1 + epoch))

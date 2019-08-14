@@ -5,7 +5,6 @@ import os
 import collections
 import random
 import numpy as np
-import mujoco_py
 
 
 LOG_STD_MAX = 2
@@ -156,7 +155,7 @@ class Agent():
 
             try:
                 new_obs, reward, done, _ = self.env.step(action_detached)
-            except mujoco_py.builder.MujocoException:
+            except Exception:
                 print(f"Exception when trying to step at step {steps} with done signal {done}")
             done = False if steps == self.max_ep_len else done
 
@@ -248,8 +247,9 @@ def train_base(args):
 
 
 def get_filenames(args):
-    logfile = os.path.join(args.dir, args.exp_name + "_data.csv")
-    paramsfile = os.path.join(args.dir, args.exp_name + "_params.mdl")
+    module_root = os.path.dirname(os.path.realpath(__file__))
+    logfile = os.path.join(module_root, args.dir, args.exp_name + "_data.csv")
+    paramsfile = os.path.join(module_root, args.dir, args.exp_name + "_params.mdl")
     if args.clear:
         if os.path.exists(logfile):
             os.remove(logfile)
@@ -270,7 +270,7 @@ def base_argparser():
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("env_name", type=str)
+    parser.add_argument("--env_name", type=str)
     parser.add_argument("--exp_name", type=str)
     parser.add_argument("--dir", type=str, default=None)
     parser.add_argument("--seed", type=int, default=0)
@@ -282,9 +282,13 @@ def base_argparser():
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--scale_hypers", type=float, default=1.0)
-    parser.add_argument("--test_iters", type=int, default=3)
+    parser.add_argument("--test_iters", type=int, default=10)
     parser.add_argument("--start_steps", type=int, default=10000)
     parser.add_argument("--test", action="store_true")
     parser.add_argument("--clear", action="store_true", help="clear out previous logs")
+    
+    parser.add_argument("--backend", type=str, default=None)
+    parser.add_argument("--remote", action="store_true")
+    parser.add_argument("--update", action="store_true")
 
     return parser
