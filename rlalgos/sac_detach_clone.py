@@ -19,7 +19,7 @@ def act(pi, act_limit, obs, deterministic=False):
         unsquashed_sample = mu + normal_noise * std
         sample = torch.tanh(unsquashed_sample)
 
-        log_prob = -0.5 * torch.sum((unsquashed_sample)**2 + 2 * log_std + LOG_PROB_CONST, dim=-1)
+        log_prob = -0.5 * torch.sum((normal_noise)**2 + 2 * log_std + LOG_PROB_CONST, dim=-1)
 
         # from https://github.com/openai/jachiam-sandbox/blob/master/Standalone-RL/myrl/algos/sac_new/sac.py#L51
         log_prob -= torch.sum(2 * (LOG_PROB_CONST2 - unsquashed_sample - torch.nn.functional.softplus(-2 * unsquashed_sample)), dim=-1)
