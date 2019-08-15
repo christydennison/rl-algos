@@ -93,13 +93,14 @@ def train(args):
                 q0_fresh_res = q0(obs_acts_fresh)
                 entropy_bonus = -args.alpha * log_probs
 
+                # TARGETS
                 with torch.no_grad():
-                    q_target = (rews + args.gamma * neg_done_floats * v_targ_res)#.detach()
-                    v_target = (torch.min(q0_res, q1_res) - entropy_bonus)#.detach()
+                    q_target = (rews + args.gamma * neg_done_floats * v_targ_res)
+                    v_target = (torch.min(q0_res, q1_res) - entropy_bonus)
 
-                q0_loss = torch.mean((q0_res - q_target)**2) #q_mse_loss(q0_res, q_target)
-                q1_loss = torch.mean((q1_res - q_target)**2) # q_mse_loss(q1_res, q_target)
-                v_loss = torch.mean((v_res - v_target)**2) # v_mse_loss(v_res, v_target)
+                q0_loss = torch.mean((q0_res - q_target)**2)
+                q1_loss = torch.mean((q1_res - q_target)**2)
+                v_loss = torch.mean((v_res - v_target)**2)
                 # qv_loss = q0_loss + q1_loss + v_loss
                 pi_loss = -torch.mean(q0_fresh_res + entropy_bonus)  # gradient ascent -> descent
 
@@ -123,15 +124,10 @@ def train(args):
                 v_loss.backward()
                 v_optimizer.step()
 
-                # v_targ_state_dict = v_targ.state_dict()
-                # for name, params in v.state_dict().items():
-                #     v_targ_state_dict[name] = args.polyak * v_targ_state_dict[name] + (1 - args.polyak) * params
                 for target_param, param in zip(v_targ.parameters(), v.parameters()):
                     target_param.data.copy_(target_param.data * args.polyak + param.data * (1.0 - args.polyak))
 
                 entropy_bonuses.append(entropy_bonus.clone().detach().numpy())
-                # entropy.append(torch.mean(torch.sum(torch.exp(log_probs) * log_probs, dim=-1)).detach().numpy())
-                # entropy.append(torch.sum(log_stds, dim=-1).item())
                 pi_losses.append(pi_loss.clone().item())
                 q0_losses.append(q0_loss.clone().item())
                 q1_losses.append(q1_loss.clone().item())
@@ -140,7 +136,6 @@ def train(args):
 
         ep_rew = np.array(epoch_rews)
         ep_entropy_bonus = np.array(entropy_bonuses)
-        # ep_entropy = np.array(entropy)
         ep_pi_losses = np.array(pi_losses)
         ep_q0_losses = np.array(q0_losses)
         ep_q1_losses = np.array(q1_losses)
@@ -160,12 +155,10 @@ def train(args):
         log.log_tabular("AverageEpLen", ep_lens_mean.mean())
         log.log_tabular("TestEpLen", test_ep_len)
         log.log_tabular("EntropyBonus", ep_entropy_bonus.mean())
-        # log.log_tabular("Entropy", ep_entropy.mean())
         log.log_tabular("PiLoss", ep_pi_losses.mean())
         log.log_tabular("Q0Loss", ep_q0_losses.mean())
         log.log_tabular("Q1Loss", ep_q1_losses.mean())
         log.log_tabular("VLoss", ep_v_losses.mean())
-        # log.log_tabular("ActMean", ep_act_mean.mean())
         log.log_tabular("Time", time.time() - start)
         log.log_tabular("StepRangeMin", ep_step_ranges.min())
         log.log_tabular("StepRangeMax", ep_step_ranges.max())
