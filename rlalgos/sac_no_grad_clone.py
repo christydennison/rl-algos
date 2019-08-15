@@ -23,6 +23,7 @@ def act(pi, act_limit, obs, deterministic=False):
 
         # from https://github.com/openai/jachiam-sandbox/blob/master/Standalone-RL/myrl/algos/sac_new/sac.py#L51
         log_prob -= torch.sum(2 * (LOG_PROB_CONST2 - unsquashed_sample - torch.nn.functional.softplus(-2 * unsquashed_sample)), dim=-1)
+
         log_prob = log_prob.unsqueeze(-1)
     else:
         sample = np.tanh(mu)
@@ -51,9 +52,6 @@ def train(args):
     log = DataLogger(logfile, args)
 
     start = time.time()
-    # q0_optimizer = torch.optim.Adam(q0.parameters(), lr=args.lr)
-    # q1_optimizer = torch.optim.Adam(q1.parameters(), lr=args.lr)
-    # v_optimizer = torch.optim.Adam(v.parameters(), lr=args.lr)
     qv_optimizer = torch.optim.Adam(list(q0.parameters()) + list(q1.parameters()) + list(v.parameters()), lr=args.lr)
     pi_optimizer = torch.optim.Adam(pi.parameters(), lr=args.lr)
 
@@ -93,13 +91,14 @@ def train(args):
                 q0_fresh_res = q0(obs_acts_fresh)
                 entropy_bonus = -args.alpha * log_probs
 
+                # TARGETS
                 with torch.no_grad():
-                    q_target = (rews + args.gamma * neg_done_floats * v_targ_res)#.detach()
-                    v_target = (torch.min(q0_res, q1_res) - entropy_bonus)#.detach()
+                    q_target = (rews + args.gamma * neg_done_floats * v_targ_res)
+                    v_target = (torch.min(q0_res, q1_res) - entropy_bonus)
 
-                q0_loss = 0.5 * torch.mean((q0_res - q_target)**2) #q_mse_loss(q0_res, q_target)
-                q1_loss = 0.5 * torch.mean((q1_res - q_target)**2) # q_mse_loss(q1_res, q_target)
-                v_loss = 0.5 * torch.mean((v_res - v_target)**2) # v_mse_loss(v_res, v_target)
+                q0_loss = 0.5 * torch.mean((q0_res - q_target)**2)
+                q1_loss = 0.5 * torch.mean((q1_res - q_target)**2)
+                v_loss = 0.5 * torch.mean((v_res - v_target)**2)
                 qv_loss = q0_loss + q1_loss + v_loss
                 pi_loss = -torch.mean(q0_fresh_res + entropy_bonus)  # gradient ascent -> descent
 
@@ -111,21 +110,6 @@ def train(args):
                 pi_loss.backward()
                 pi_optimizer.step()
 
-                # q0_optimizer.zero_grad()
-                # q0_loss.backward()
-                # q0_optimizer.step()
-
-                # q1_optimizer.zero_grad()
-                # q1_loss.backward()
-                # q1_optimizer.step()
-
-                # v_optimizer.zero_grad()
-                # v_loss.backward()
-                # v_optimizer.step()
-
-                # v_targ_state_dict = v_targ.state_dict()
-                # for name, params in v.state_dict().items():
-                #     v_targ_state_dict[name] = args.polyak * v_targ_state_dict[name] + (1 - args.polyak) * params
                 for target_param, param in zip(v_targ.parameters(), v.parameters()):
                     target_param.data.copy_(target_param.data * args.polyak + param.data * (1.0 - args.polyak))
 

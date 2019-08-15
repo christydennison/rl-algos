@@ -290,5 +290,6 @@ def base_argparser():
     parser.add_argument("--backend", type=str, default=None)
     parser.add_argument("--remote", action="store_true")
     parser.add_argument("--update", action="store_true")
+    parser.add_argument("--trace", action="store_true")
 
     return parser

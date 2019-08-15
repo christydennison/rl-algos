@@ -2,14 +2,20 @@ import torch
 import time
 import gym
 import numpy as np
-from rlalgos.base import *
-from rcall import meta
+from base import *
 
 
 LOG_PROB_CONST2 = np.log(2)
+trace = False
+pi_trace = None
+q0_trace = None
+q1_trace = None
 
 
 def act(pi, act_limit, obs, deterministic=False):
+    if trace:
+        with torch.onnx.set_training(model, False):
+            model_trace, _ = torch.jit.get_trace_graph(pi, args=(obs,))
     res = pi(obs)
     mu, log_std = torch.chunk(res, 2, dim=-1)
     log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
@@ -23,7 +29,6 @@ def act(pi, act_limit, obs, deterministic=False):
 
         # from https://github.com/openai/jachiam-sandbox/blob/master/Standalone-RL/myrl/algos/sac_new/sac.py#L51
         log_prob -= torch.sum(2 * (LOG_PROB_CONST2 - unsquashed_sample - torch.nn.functional.softplus(-2 * unsquashed_sample)), dim=-1)
-
         log_prob = log_prob.unsqueeze(-1)
     else:
         sample = np.tanh(mu)
@@ -52,6 +57,9 @@ def train(args):
     log = DataLogger(logfile, args)
 
     start = time.time()
+    # q0_optimizer = torch.optim.Adam(q0.parameters(), lr=args.lr)
+    # q1_optimizer = torch.optim.Adam(q1.parameters(), lr=args.lr)
+    # v_optimizer = torch.optim.Adam(v.parameters(), lr=args.lr)
     qv_optimizer = torch.optim.Adam(list(q0.parameters()) + list(q1.parameters()) + list(v.parameters()), lr=args.lr)
     pi_optimizer = torch.optim.Adam(pi.parameters(), lr=args.lr)
 
@@ -91,34 +99,49 @@ def train(args):
                 q0_fresh_res = q0(obs_acts_fresh)
                 entropy_bonus = -args.alpha * log_probs
 
-                # TARGETS
-                q_target = (rews + args.gamma * neg_done_floats * v_targ_res).detach()
-                v_target = (torch.min(q0_res, q1_res) - entropy_bonus).detach()
+                with torch.no_grad():
+                    q_target = (rews + args.gamma * neg_done_floats * v_targ_res)#.detach()
+                    v_target = (torch.min(q0_res, q1_res) - entropy_bonus)#.detach()
 
-                q0_loss = 0.5 * torch.mean((q0_res - q_target)**2)
-                q1_loss = 0.5 * torch.mean((q1_res - q_target)**2)
-                v_loss = 0.5 * torch.mean((v_res - v_target)**2)
+                q0_loss = 0.5 * torch.mean((q0_res - q_target)**2) #q_mse_loss(q0_res, q_target)
+                q1_loss = 0.5 * torch.mean((q1_res - q_target)**2) # q_mse_loss(q1_res, q_target)
+                v_loss = 0.5 * torch.mean((v_res - v_target)**2) # v_mse_loss(v_res, v_target)
                 qv_loss = q0_loss + q1_loss + v_loss
                 pi_loss = -torch.mean(q0_fresh_res + entropy_bonus)  # gradient ascent -> descent
 
                 qv_optimizer.zero_grad()
                 qv_loss.backward()
-                import ipdb; ipdb.set_trace()
                 qv_optimizer.step()
 
                 pi_optimizer.zero_grad()
                 pi_loss.backward()
                 pi_optimizer.step()
+
+                # q0_optimizer.zero_grad()
+                # q0_loss.backward()
+                # q0_optimizer.step()
+
+                # q1_optimizer.zero_grad()
+                # q1_loss.backward()
+                # q1_optimizer.step()
+
+                # v_optimizer.zero_grad()
+                # v_loss.backward()
+                # v_optimizer.step()
+
+                # v_targ_state_dict = v_targ.state_dict()
+                # for name, params in v.state_dict().items():
+                #     v_targ_state_dict[name] = args.polyak * v_targ_state_dict[name] + (1 - args.polyak) * params
                 for target_param, param in zip(v_targ.parameters(), v.parameters()):
                     target_param.data.copy_(target_param.data * args.polyak + param.data * (1.0 - args.polyak))
 
                 entropy_bonuses.append(entropy_bonus.clone().detach().numpy())
                 # entropy.append(torch.mean(torch.sum(torch.exp(log_probs) * log_probs, dim=-1)).detach().numpy())
                 # entropy.append(torch.sum(log_stds, dim=-1).item())
-                pi_losses.append(pi_loss.clone().detach().item())
-                q0_losses.append(q0_loss.clone().detach().item())
-                q1_losses.append(q1_loss.clone().detach().item())
-                v_losses.append(v_loss.clone().detach().item())
+                pi_losses.append(pi_loss.clone().item())
+                q0_losses.append(q0_loss.clone().item())
+                q1_losses.append(q1_loss.clone().item())
+                v_losses.append(v_loss.clone().item())
                 act_mean.append(torch.sum(torch.mean(act_limit - torch.abs(acts), dim=0)))  # how close to the edges of the act limit are the actions
 
         ep_rew = np.array(epoch_rews)
@@ -184,28 +207,18 @@ def main():
     steps_per_epoch=5000, epochs=100, replay_size=1000000, gamma=0.99, polyak=0.995,
     lr=0.001, alpha=0.2, batch_size=100, start_steps=10000, max_ep_len=1000, logger_kwargs={}, save_freq=1)
     '''
+    global trace
     parser = base_argparser()
     parser.add_argument("--polyak", type=float, default=0.995)
     parser.add_argument("--alpha", type=float, default=0.2)
     args = parser.parse_args()
     scale_hypers(args)
+    trace = args.trace
 
     if args.test:
         test(args)
     else:
-        if args.remote:
-            name = 'detach-clone-'+str(args.seed)
-            meta.call(
-                backend=args.backend,
-                fn=train,
-                kwargs=dict(args=args),
-                log_relpath=name,
-                job_name=name,
-                update=args.update,
-                num_gpu=0,
-            )
-        else:
-            train(args)
+        train(args)
 
 
 if __name__ == "__main__":

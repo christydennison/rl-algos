@@ -81,7 +81,7 @@ def train(args):
                 step_ranges.append(steps_for_sample)
 
                 old_obs_acts = torch.cat([old_obs, acts], dim=1)
-                neg_done_floats = (1 - dones).float()
+                neg_done_floats = (~dones).float()
                 q0_res = q0(old_obs_acts)
                 q1_res = q1(old_obs_acts)
                 v_targ_res = v_targ(new_obs)
