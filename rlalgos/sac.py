@@ -18,7 +18,7 @@ def act(pi, act_limit, obs, deterministic=False):
         unsquashed_sample = mu + normal_noise * std
         sample = torch.tanh(unsquashed_sample)
 
-        log_prob = -0.5 * torch.sum((normal_noise)**2 + 2 * log_std + LOG_PROB_CONST, dim=-1)
+        log_prob = torch.sum(-0.5 * ((normal_noise)**2 + 2 * log_std + LOG_PROB_CONST), dim=-1)
 
         # from https://github.com/openai/jachiam-sandbox/blob/master/Standalone-RL/myrl/algos/sac_new/sac.py#L51
         log_prob -= torch.sum(2 * (LOG_PROB_CONST2 - unsquashed_sample - torch.nn.functional.softplus(-2 * unsquashed_sample)), dim=-1)
@@ -61,7 +61,6 @@ def train(args):
         step = 0
         epoch_rews = []
         entropy_bonuses = []
-        # entropy = []
         pi_losses = []
         q0_losses = []
         q1_losses = []
@@ -122,15 +121,10 @@ def train(args):
                 # v_loss.backward()
                 # v_optimizer.step()
 
-                # v_targ_state_dict = v_targ.state_dict()
-                # for name, params in v.state_dict().items():
-                #     v_targ_state_dict[name] = args.polyak * v_targ_state_dict[name] + (1 - args.polyak) * params
                 for target_param, param in zip(v_targ.parameters(), v.parameters()):
                     target_param.data.copy_(target_param.data * args.polyak + param.data * (1.0 - args.polyak))
 
                 entropy_bonuses.append(entropy_bonus.clone().detach().numpy())
-                # entropy.append(torch.mean(torch.sum(torch.exp(log_probs) * log_probs, dim=-1)).detach().numpy())
-                # entropy.append(torch.sum(log_stds, dim=-1).item())
                 pi_losses.append(pi_loss.clone().item())
                 q0_losses.append(q0_loss.clone().item())
                 q1_losses.append(q1_loss.clone().item())
@@ -139,7 +133,6 @@ def train(args):
 
         ep_rew = np.array(epoch_rews)
         ep_entropy_bonus = np.array(entropy_bonuses)
-        # ep_entropy = np.array(entropy)
         ep_pi_losses = np.array(pi_losses)
         ep_q0_losses = np.array(q0_losses)
         ep_q1_losses = np.array(q1_losses)
@@ -159,12 +152,10 @@ def train(args):
         log.log_tabular("AverageEpLen", ep_lens_mean.mean())
         log.log_tabular("TestEpLen", test_ep_len)
         log.log_tabular("EntropyBonus", ep_entropy_bonus.mean())
-        # log.log_tabular("Entropy", ep_entropy.mean())
         log.log_tabular("PiLoss", ep_pi_losses.mean())
         log.log_tabular("Q0Loss", ep_q0_losses.mean())
         log.log_tabular("Q1Loss", ep_q1_losses.mean())
         log.log_tabular("VLoss", ep_v_losses.mean())
-        # log.log_tabular("ActMean", ep_act_mean.mean())
         log.log_tabular("Time", time.time() - start)
         log.log_tabular("StepRangeMin", ep_step_ranges.min())
         log.log_tabular("StepRangeMax", ep_step_ranges.max())

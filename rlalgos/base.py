@@ -12,6 +12,7 @@ LOG_STD_MIN = -20
 LOG_PROB_CONST = np.log(2 * np.pi)
 
 Transition = collections.namedtuple("Transition", ["old_obs", "new_obs", "action", "reward", "done", "log_prob", "step"])
+Trajectory = collections.namedtuple("Trajectory", ["s", "sp", "actions", "rewards", "dones", "log_probs", "steps"])
 
 dtype = torch.float
 
@@ -101,7 +102,7 @@ class ReplayBuffer():
             dones.append(torch.tensor(transition.done))
             log_probs.append(torch.tensor(transition.log_prob).unsqueeze(0))
             steps.append(transition.step)
-        return torch.cat(old_obs).float(), torch.cat(new_obs).float(), torch.cat(acts).float(), torch.tensor(rews).unsqueeze(1).float(), torch.tensor(dones).unsqueeze(1), torch.tensor(log_probs).unsqueeze(1).float(), np.array(steps)
+        return Trajectory(torch.cat(old_obs).float(), torch.cat(new_obs).float(), torch.cat(acts).float(), torch.tensor(rews).unsqueeze(1).float(), torch.tensor(dones).unsqueeze(1), torch.tensor(log_probs).unsqueeze(1).float(), np.array(steps))
 
     def sample(self, batch_size):
         transitions = random.sample(self.data, batch_size)
@@ -144,6 +145,10 @@ class Agent():
         old_obs = self.env.reset()
         steps = 0
         ep_rew = 0
+
+        # reset to memorize trajectory
+        # set_seeds(self.env, self.args.seed)
+        # self.env.seed(self.args.seed)
 
         while not(done or steps >= self.max_ep_len):
             if not self.started and self.start_steps <= self.total_steps:
@@ -229,6 +234,12 @@ class DataLogger():
         return pd.read_table(self.filename)
 
 
+def set_seeds(env, seed):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    env.seed(seed)
+
+
 def train_base(args):
     env = gym.make(args.env_name)
     test_env = gym.make(args.env_name)
@@ -236,14 +247,20 @@ def train_base(args):
     discrete = isinstance(env.action_space, gym.spaces.Discrete)
     print("*** IS DISCRETE: ", discrete)
 
-    # set seeds
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    env.seed(args.seed)
+    set_seeds(env, args.seed)
 
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
     return env, test_env, act_limit, obs_dim, act_dim
+
+
+def print_grad(var, var_name, logger):
+    if logger is None:
+        return
+    try:
+        var.register_hook(lambda grad: logger.add(var_name, grad))
+    except RuntimeError as re:
+        print(var_name, "not registered because no gradient present!")
 
 
 def get_filenames(args):
