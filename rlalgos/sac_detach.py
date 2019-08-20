@@ -19,11 +19,10 @@ def act(pi, act_limit, obs, deterministic=False):
         unsquashed_sample = mu + normal_noise * std
         sample = torch.tanh(unsquashed_sample)
 
-        log_prob = -0.5 * torch.sum((normal_noise)**2 + 2 * log_std + LOG_PROB_CONST, dim=-1)
+        log_prob = torch.sum(-0.5 * ((normal_noise)**2 + 2 * log_std + LOG_PROB_CONST), dim=-1)
 
         # from https://github.com/openai/jachiam-sandbox/blob/master/Standalone-RL/myrl/algos/sac_new/sac.py#L51
         log_prob -= torch.sum(2 * (LOG_PROB_CONST2 - unsquashed_sample - torch.nn.functional.softplus(-2 * unsquashed_sample)), dim=-1)
-
         log_prob = log_prob.unsqueeze(-1)
     else:
         sample = np.tanh(mu)
@@ -52,6 +51,9 @@ def train(args):
     log = DataLogger(logfile, args)
 
     start = time.time()
+    # q0_optimizer = torch.optim.Adam(q0.parameters(), lr=args.lr)
+    # q1_optimizer = torch.optim.Adam(q1.parameters(), lr=args.lr)
+    # v_optimizer = torch.optim.Adam(v.parameters(), lr=args.lr)
     qv_optimizer = torch.optim.Adam(list(q0.parameters()) + list(q1.parameters()) + list(v.parameters()), lr=args.lr)
     pi_optimizer = torch.optim.Adam(pi.parameters(), lr=args.lr)
 
@@ -75,7 +77,7 @@ def train(args):
             step += traj_steps
 
             for _ in range(args.max_ep_len):
-                old_obs, new_obs, acts, rews, dones, _, steps_for_sample = agent.replay_buffer.sample(args.batch_size)
+                old_obs, new_obs, acts, rews, costs, dones, _, steps_for_sample = agent.replay_buffer.sample(args.batch_size)
                 step_ranges.append(steps_for_sample)
 
                 old_obs_acts = torch.cat([old_obs, acts], dim=1)
@@ -90,14 +92,13 @@ def train(args):
                 q0_fresh_res = q0(obs_acts_fresh)
                 entropy_bonus = -args.alpha * log_probs
 
-                # TARGETS
-                with torch.no_grad():
-                    q_target = (rews + args.gamma * neg_done_floats * v_targ_res)
-                    v_target = (torch.min(q0_res, q1_res) - entropy_bonus)
+                # with torch.no_grad():
+                q_target = (rews + args.gamma * neg_done_floats * v_targ_res).detach()
+                v_target = (torch.min(q0_res, q1_res) - entropy_bonus).detach()
 
-                q0_loss = 0.5 * torch.mean((q0_res - q_target)**2)
-                q1_loss = 0.5 * torch.mean((q1_res - q_target)**2)
-                v_loss = 0.5 * torch.mean((v_res - v_target)**2)
+                q0_loss = 0.5 * torch.mean((q0_res - q_target)**2) #q_mse_loss(q0_res, q_target)
+                q1_loss = 0.5 * torch.mean((q1_res - q_target)**2) # q_mse_loss(q1_res, q_target)
+                v_loss = 0.5 * torch.mean((v_res - v_target)**2) # v_mse_loss(v_res, v_target)
                 qv_loss = q0_loss + q1_loss + v_loss
                 pi_loss = -torch.mean(q0_fresh_res + entropy_bonus)  # gradient ascent -> descent
 
@@ -108,6 +109,18 @@ def train(args):
                 pi_optimizer.zero_grad()
                 pi_loss.backward()
                 pi_optimizer.step()
+
+                # q0_optimizer.zero_grad()
+                # q0_loss.backward()
+                # q0_optimizer.step()
+
+                # q1_optimizer.zero_grad()
+                # q1_loss.backward()
+                # q1_optimizer.step()
+
+                # v_optimizer.zero_grad()
+                # v_loss.backward()
+                # v_optimizer.step()
 
                 for target_param, param in zip(v_targ.parameters(), v.parameters()):
                     target_param.data.copy_(target_param.data * args.polyak + param.data * (1.0 - args.polyak))
@@ -129,7 +142,7 @@ def train(args):
         ep_lens_mean = np.array(ep_lens)
         ep_step_ranges = np.array(step_ranges)
 
-        test_ep_len, test_ep_rew = agent.test(render=False)
+        test_ep_len, test_ep_rew, _ = agent.test(render=False)
 
         log.log_tabular("ExpName", args.exp_name)
         log.log_tabular("AverageReturn", ep_rew.mean())
@@ -189,7 +202,7 @@ def main():
         test(args)
     else:
         if args.remote:
-            name = 'no-grad-clone-'+str(args.seed)
+            name = '-'.join([*args.exp_name.split('_'), str(args.seed)])
             meta.call(
                 backend=args.backend,
                 fn=train,

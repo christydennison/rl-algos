@@ -8,7 +8,7 @@ def plot(args):
     data = pd.concat(data, ignore_index=True, sort=False)
     sns.set(style="darkgrid")
     legend = len(args.filenames) > 1
-    g = sns.relplot(x="Steps", y=args.key, kind="line", hue="ExpName", data=data, legend="brief" if legend else False)
+    g = sns.relplot(x="Epoch", y=args.key, kind="line", hue="ExpName", data=data, legend="brief" if legend else False)
     if legend:
         g._legend.set_draggable(state=True)
     g.fig.subplots_adjust(top=0.9)

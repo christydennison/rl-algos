@@ -2,20 +2,14 @@ import torch
 import time
 import gym
 import numpy as np
-from base import *
+from rlalgos.base import *
+from rcall import meta
 
 
 LOG_PROB_CONST2 = np.log(2)
-trace = False
-pi_trace = None
-q0_trace = None
-q1_trace = None
 
 
 def act(pi, act_limit, obs, deterministic=False):
-    if trace:
-        with torch.onnx.set_training(model, False):
-            model_trace, _ = torch.jit.get_trace_graph(pi, args=(obs,))
     res = pi(obs)
     mu, log_std = torch.chunk(res, 2, dim=-1)
     log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
@@ -25,7 +19,7 @@ def act(pi, act_limit, obs, deterministic=False):
         unsquashed_sample = mu + normal_noise * std
         sample = torch.tanh(unsquashed_sample)
 
-        log_prob = -0.5 * torch.sum((normal_noise)**2 + 2 * log_std + LOG_PROB_CONST, dim=-1)
+        log_prob = torch.sum(-0.5 * ((normal_noise)**2 + 2 * log_std + LOG_PROB_CONST), dim=-1)
 
         # from https://github.com/openai/jachiam-sandbox/blob/master/Standalone-RL/myrl/algos/sac_new/sac.py#L51
         log_prob -= torch.sum(2 * (LOG_PROB_CONST2 - unsquashed_sample - torch.nn.functional.softplus(-2 * unsquashed_sample)), dim=-1)
@@ -68,7 +62,6 @@ def train(args):
         step = 0
         epoch_rews = []
         entropy_bonuses = []
-        # entropy = []
         pi_losses = []
         q0_losses = []
         q1_losses = []
@@ -84,7 +77,7 @@ def train(args):
             step += traj_steps
 
             for _ in range(args.max_ep_len):
-                old_obs, new_obs, acts, rews, dones, _, steps_for_sample = agent.replay_buffer.sample(args.batch_size)
+                old_obs, new_obs, acts, rews, costs, dones, _, steps_for_sample = agent.replay_buffer.sample(args.batch_size)
                 step_ranges.append(steps_for_sample)
 
                 old_obs_acts = torch.cat([old_obs, acts], dim=1)
@@ -99,9 +92,9 @@ def train(args):
                 q0_fresh_res = q0(obs_acts_fresh)
                 entropy_bonus = -args.alpha * log_probs
 
-                with torch.no_grad():
-                    q_target = (rews + args.gamma * neg_done_floats * v_targ_res)#.detach()
-                    v_target = (torch.min(q0_res, q1_res) - entropy_bonus)#.detach()
+                # with torch.no_grad():
+                q_target = (rews + args.gamma * neg_done_floats * v_targ_res.detach())#.detach()
+                v_target = (torch.min(q0_res.detach(), q1_res.detach()) - entropy_bonus.detach())#.detach()
 
                 q0_loss = 0.5 * torch.mean((q0_res - q_target)**2) #q_mse_loss(q0_res, q_target)
                 q1_loss = 0.5 * torch.mean((q1_res - q_target)**2) # q_mse_loss(q1_res, q_target)
@@ -129,15 +122,10 @@ def train(args):
                 # v_loss.backward()
                 # v_optimizer.step()
 
-                # v_targ_state_dict = v_targ.state_dict()
-                # for name, params in v.state_dict().items():
-                #     v_targ_state_dict[name] = args.polyak * v_targ_state_dict[name] + (1 - args.polyak) * params
                 for target_param, param in zip(v_targ.parameters(), v.parameters()):
                     target_param.data.copy_(target_param.data * args.polyak + param.data * (1.0 - args.polyak))
 
                 entropy_bonuses.append(entropy_bonus.clone().detach().numpy())
-                # entropy.append(torch.mean(torch.sum(torch.exp(log_probs) * log_probs, dim=-1)).detach().numpy())
-                # entropy.append(torch.sum(log_stds, dim=-1).item())
                 pi_losses.append(pi_loss.clone().item())
                 q0_losses.append(q0_loss.clone().item())
                 q1_losses.append(q1_loss.clone().item())
@@ -146,7 +134,6 @@ def train(args):
 
         ep_rew = np.array(epoch_rews)
         ep_entropy_bonus = np.array(entropy_bonuses)
-        # ep_entropy = np.array(entropy)
         ep_pi_losses = np.array(pi_losses)
         ep_q0_losses = np.array(q0_losses)
         ep_q1_losses = np.array(q1_losses)
@@ -155,7 +142,7 @@ def train(args):
         ep_lens_mean = np.array(ep_lens)
         ep_step_ranges = np.array(step_ranges)
 
-        test_ep_len, test_ep_rew = agent.test(render=False)
+        test_ep_len, test_ep_rew, _ = agent.test(render=False)
 
         log.log_tabular("ExpName", args.exp_name)
         log.log_tabular("AverageReturn", ep_rew.mean())
@@ -166,12 +153,10 @@ def train(args):
         log.log_tabular("AverageEpLen", ep_lens_mean.mean())
         log.log_tabular("TestEpLen", test_ep_len)
         log.log_tabular("EntropyBonus", ep_entropy_bonus.mean())
-        # log.log_tabular("Entropy", ep_entropy.mean())
         log.log_tabular("PiLoss", ep_pi_losses.mean())
         log.log_tabular("Q0Loss", ep_q0_losses.mean())
         log.log_tabular("Q1Loss", ep_q1_losses.mean())
         log.log_tabular("VLoss", ep_v_losses.mean())
-        # log.log_tabular("ActMean", ep_act_mean.mean())
         log.log_tabular("Time", time.time() - start)
         log.log_tabular("StepRangeMin", ep_step_ranges.min())
         log.log_tabular("StepRangeMax", ep_step_ranges.max())
@@ -207,18 +192,28 @@ def main():
     steps_per_epoch=5000, epochs=100, replay_size=1000000, gamma=0.99, polyak=0.995,
     lr=0.001, alpha=0.2, batch_size=100, start_steps=10000, max_ep_len=1000, logger_kwargs={}, save_freq=1)
     '''
-    global trace
     parser = base_argparser()
     parser.add_argument("--polyak", type=float, default=0.995)
     parser.add_argument("--alpha", type=float, default=0.2)
     args = parser.parse_args()
     scale_hypers(args)
-    trace = args.trace
 
     if args.test:
         test(args)
     else:
-        train(args)
+        if args.remote:
+            name = '-'.join([*args.exp_name.split('_'), str(args.seed)])
+            meta.call(
+                backend=args.backend,
+                fn=train,
+                kwargs=dict(args=args),
+                log_relpath=name,
+                job_name=name,
+                update=args.update,
+                num_gpu=0,
+            )
+        else:
+            train(args)
 
 
 if __name__ == "__main__":

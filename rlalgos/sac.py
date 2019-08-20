@@ -2,7 +2,8 @@ import torch
 import time
 import gym
 import numpy as np
-from base import *
+from rlalgos.base import *
+from rcall import meta
 
 
 LOG_PROB_CONST2 = np.log(2)
@@ -76,7 +77,7 @@ def train(args):
             step += traj_steps
 
             for _ in range(args.max_ep_len):
-                old_obs, new_obs, acts, rews, dones, _, steps_for_sample = agent.replay_buffer.sample(args.batch_size)
+                old_obs, new_obs, acts, rews, costs, dones, _, steps_for_sample = agent.replay_buffer.sample(args.batch_size)
                 step_ranges.append(steps_for_sample)
 
                 old_obs_acts = torch.cat([old_obs, acts], dim=1)
@@ -141,7 +142,7 @@ def train(args):
         ep_lens_mean = np.array(ep_lens)
         ep_step_ranges = np.array(step_ranges)
 
-        test_ep_len, test_ep_rew = agent.test(render=False)
+        test_ep_len, test_ep_rew, _ = agent.test(render=False)
 
         log.log_tabular("ExpName", args.exp_name)
         log.log_tabular("AverageReturn", ep_rew.mean())
@@ -200,7 +201,19 @@ def main():
     if args.test:
         test(args)
     else:
-        train(args)
+        if args.remote:
+            name = '-'.join([*args.exp_name.split('_'), str(args.seed)])
+            meta.call(
+                backend=args.backend,
+                fn=train,
+                kwargs=dict(args=args),
+                log_relpath=name,
+                job_name=name,
+                update=args.update,
+                num_gpu=0,
+            )
+        else:
+            train(args)
 
 
 if __name__ == "__main__":

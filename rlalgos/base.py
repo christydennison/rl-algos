@@ -11,10 +11,19 @@ LOG_STD_MAX = 2
 LOG_STD_MIN = -20
 LOG_PROB_CONST = np.log(2 * np.pi)
 
-Transition = collections.namedtuple("Transition", ["old_obs", "new_obs", "action", "reward", "done", "log_prob", "step"])
-Trajectory = collections.namedtuple("Trajectory", ["s", "sp", "actions", "rewards", "dones", "log_probs", "steps"])
+Transition = collections.namedtuple("Transition", ["old_obs", "new_obs", "action", "reward", "cost", "done", "log_prob", "step"])
+Trajectory = collections.namedtuple("Trajectory", ["s", "sp", "actions", "rewards", "costs", "dones", "log_probs", "steps"])
 
 dtype = torch.float
+
+
+class SoftVar(torch.nn.Module):
+    def __init__(self, var_size):
+        super(SplitNet, self).__init__()
+        self.var = torch.nn.Parameter(torch.rand(var_size, dtype=torch.float32, requires_grad=True))
+
+    def forward():
+        return torch.nn.Softplus(self.var)
 
 
 class SplitNet(torch.nn.Module):
@@ -80,6 +89,15 @@ class Net(torch.nn.Module):
         return self.seq(*inp)
 
 
+class NetWithVar(Net):
+    def __init__(self, input_size, output_sizes, var_size, hidden_sizes=(400, 300), activation=torch.nn.ReLU, output_activation=None):
+        super(NetWithVar, self).__init__(input_size, output_sizes, hidden_sizes, activation, output_activation)
+        self.var = torch.nn.Parameter(torch.rand(var_size, dtype=torch.float32, requires_grad=True))
+
+    def forward(self, *inp):
+        return self.seq(*inp), self.var
+
+
 class ReplayBuffer():
     def __init__(self, maxsize):
         self.data = []
@@ -93,16 +111,17 @@ class ReplayBuffer():
         return len(self.data)
 
     def _split(self, transitions):
-        old_obs, new_obs, acts, rews, dones, log_probs, steps = [], [], [], [], [], [], []
+        old_obs, new_obs, acts, rews, costs, dones, log_probs, steps = [], [], [], [], [], [], [], []
         for transition in transitions:
             old_obs.append(torch.tensor(transition.old_obs).unsqueeze(0))
             new_obs.append(torch.tensor(transition.new_obs).unsqueeze(0))
             acts.append(torch.tensor(transition.action).unsqueeze(0))
             rews.append(torch.tensor(transition.reward))
+            costs.append(torch.tensor(transition.cost))
             dones.append(torch.tensor(transition.done))
             log_probs.append(torch.tensor(transition.log_prob).unsqueeze(0))
             steps.append(transition.step)
-        return Trajectory(torch.cat(old_obs).float(), torch.cat(new_obs).float(), torch.cat(acts).float(), torch.tensor(rews).unsqueeze(1).float(), torch.tensor(dones).unsqueeze(1), torch.tensor(log_probs).unsqueeze(1).float(), np.array(steps))
+        return Trajectory(torch.cat(old_obs).float(), torch.cat(new_obs).float(), torch.cat(acts).float(), torch.tensor(rews).unsqueeze(1).float(), torch.tensor(costs).unsqueeze(1).float(), torch.tensor(dones).unsqueeze(1), torch.tensor(log_probs).unsqueeze(1).float(), np.array(steps))
 
     def sample(self, batch_size):
         transitions = random.sample(self.data, batch_size)
@@ -145,6 +164,7 @@ class Agent():
         old_obs = self.env.reset()
         steps = 0
         ep_rew = 0
+        ep_cost = 0
 
         # reset to memorize trajectory
         # set_seeds(self.env, self.args.seed)
@@ -159,18 +179,20 @@ class Agent():
             action_detached = action.detach().numpy()
 
             try:
-                new_obs, reward, done, _ = self.env.step(action_detached)
+                new_obs, reward, done, info = self.env.step(action_detached)
+                cost = info.get('cost', 0)
             except Exception:
                 print(f"Exception when trying to step at step {steps} with done signal {done}")
             done = False if steps == self.max_ep_len else done
 
-            self.replay_buffer.add(Transition(old_obs, new_obs, action_detached, reward, done, log_prob.item(), self.total_steps))
+            self.replay_buffer.add(Transition(old_obs, new_obs, action_detached, reward, cost, done, log_prob.item(), self.total_steps))
             steps += 1
             self.total_steps += 1
             old_obs = new_obs
             ep_rew += reward
+            ep_cost += cost
 
-        return steps, ep_rew
+        return steps, ep_rew, ep_cost
 
     def run_trajectories(self):
         steps = 0
@@ -184,6 +206,7 @@ class Agent():
             self.test_env = gym.wrappers.Monitor(self.test_env, self.args.dir, force=True)
         observation = self.test_env.reset()
         total_reward = 0
+        total_cost = 0
         steps = 0
         done = False
         while not(done or steps >= self.max_ep_len):
@@ -193,13 +216,14 @@ class Agent():
             with torch.no_grad():
                 action, _, _, _ = self.act_fn(observation, random=False, deterministic=True)
 
-            observation, reward, done, _ = self.test_env.step(action.detach().numpy())
+            observation, reward, done, info = self.test_env.step(action.detach().numpy())
             total_reward += reward
+            total_cost += info.get('cost', 0)
             steps += 1
         if render:
             print(f"Ep Length: {steps}")
             print(f"Ep Reward: {total_reward}")
-        return steps, total_reward
+        return steps, total_reward, total_cost
 
     def done(self):
         self.test(render=True)

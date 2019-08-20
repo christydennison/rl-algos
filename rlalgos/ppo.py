@@ -2,7 +2,8 @@ import torch
 import time
 import gym
 import numpy as np
-from base import *
+from rlalgos.base import *
+from rcall import meta
 
 
 def gaussian_logprob(action, mu, log_std):
@@ -43,7 +44,7 @@ def reward_to_go(args, rewards):
 def compute_advantage(args, v_s_res, v_sp_res, rewards):
     delta = rewards + args.gamma * v_sp_res - v_s_res
     adv_unscaled = cumulative_sum(delta, args.gamma * args.lam)
-    return adv_unscaled #adv_unit_scaled
+    return adv_unscaled
 
 
 def kl_divergence(mu_0, mu_1, log_std0, log_std1):
@@ -107,7 +108,7 @@ def train(args):
         grad_logger.set_current_epoch(epoch)
 
         while step < args.steps_per_epoch:
-            traj_steps, ep_rew = agent.run_trajectory()
+            traj_steps, ep_rew, _ = agent.run_trajectory()
             epoch_rews.append(ep_rew)
             ep_lens.append(traj_steps)
             step += traj_steps
@@ -199,7 +200,7 @@ def train(args):
         ep_entropy = np.array(entropy)
 
         for _ in range(args.test_iters):
-            test_ep_len, test_ep_rew = agent.test(render=False)
+            test_ep_len, test_ep_rew, _ = agent.test(render=False)
             ep_lens_test.append(test_ep_len)
             ep_rew_test.append(test_ep_rew)
 
@@ -262,7 +263,19 @@ def main():
     if args.test:
         test(args)
     else:
-        train(args)
+        if args.remote:
+            name = '-'.join([*args.exp_name.split('_'), str(args.seed)])
+            meta.call(
+                backend=args.backend,
+                fn=train,
+                kwargs=dict(args=args),
+                log_relpath=name,
+                job_name=name,
+                update=args.update,
+                num_gpu=0,
+            )
+        else:
+            train(args)
 
 
 if __name__ == "__main__":
