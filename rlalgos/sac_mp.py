@@ -4,6 +4,7 @@ import gym
 import numpy as np
 from rlalgos.base import *
 from rcall import meta
+import torch.multiprocessing as mp
 
 
 LOG_PROB_CONST2 = np.log(2)
@@ -29,9 +30,8 @@ def act(pi, act_limit, obs, deterministic=False):
         log_prob = torch.tensor([0.0]).float()  # 50%
     return act_limit * sample, log_prob, torch.tanh(mu), torch.tanh(log_std)
 
-
-def train(args):
-    env, test_env, act_limit, obs_dim, act_dim = train_base(args)
+def train(index, args):
+    env, test_env, act_limit, obs_dim, act_dim = train_base(args, index=index)
 
     q0 = Net(obs_dim + act_dim, [1])
     q1 = Net(obs_dim + act_dim, [1])
@@ -48,7 +48,7 @@ def train(args):
 
     agent = Agent(args, env, test_env, curried_act)
     logfile, paramsfile = get_filenames(args)
-    log = DataLogger(logfile, args)
+    log = DataLogger(logfile, args, index)
 
     start = time.time()
     # q0_optimizer = torch.optim.Adam(q0.parameters(), lr=args.lr)
@@ -58,7 +58,7 @@ def train(args):
     pi_optimizer = torch.optim.Adam(pi.parameters(), lr=args.lr)
 
     for epoch in range(args.epochs):
-        print(f"--------Epoch {epoch}--------")
+        rank_print(index, f"--------Epoch {epoch}--------")
         step = 0
         epoch_rews = []
         entropy_bonuses = []
@@ -71,36 +71,37 @@ def train(args):
         step_ranges = []
 
         while step < args.steps_per_epoch:
-            traj_steps, ep_rew = agent.run_trajectory()
+            traj_steps, ep_rew, _ = agent.run_trajectory()
             epoch_rews.append(ep_rew)
             ep_lens.append(traj_steps)
             step += traj_steps
 
-            for _ in range(args.max_ep_len):
+            for i in range(args.max_ep_len):
                 old_obs, new_obs, acts, rews, costs, dones, _, steps_for_sample = agent.replay_buffer.sample(args.batch_size)
                 step_ranges.append(steps_for_sample)
+                neg_done_floats = (~dones).float()
 
                 old_obs_acts = torch.cat([old_obs, acts], dim=1)
-                neg_done_floats = (~dones).float()
-                q0_res = q0(old_obs_acts)
-                q1_res = q1(old_obs_acts)
-                v_targ_res = v_targ(new_obs)
-                v_res = v(old_obs)
-
                 fresh_acts, log_probs, _, _ = act(pi, act_limit, old_obs)  # fresh
                 obs_acts_fresh = torch.cat([old_obs, fresh_acts], dim=1)
+
+                q0_res = q0(old_obs_acts)
+                q1_res = q1(old_obs_acts)
                 q0_fresh_res = q0(obs_acts_fresh)
-                entropy_bonus = -args.alpha * log_probs
+                q1_fresh_res = q1(obs_acts_fresh)
+                v_targ_res = v_targ(new_obs)
+                v_res = v(old_obs)
+                entropy_bonus = args.alpha * log_probs
 
-                # with torch.no_grad():
-                q_target = (rews + args.gamma * neg_done_floats * v_targ_res.detach())#.detach()
-                v_target = (torch.min(q0_res.detach(), q1_res.detach()) - entropy_bonus.detach())#.detach()
+                with torch.no_grad():
+                    q_target = (rews + args.gamma * neg_done_floats * v_targ_res)#.detach()
+                    v_target = (torch.min(q0_fresh_res, q1_fresh_res) - entropy_bonus)#.detach()
 
-                q0_loss = 0.5 * torch.mean((q0_res - q_target)**2) #q_mse_loss(q0_res, q_target)
-                q1_loss = 0.5 * torch.mean((q1_res - q_target)**2) # q_mse_loss(q1_res, q_target)
-                v_loss = 0.5 * torch.mean((v_res - v_target)**2) # v_mse_loss(v_res, v_target)
+                q0_loss = 0.5 * torch.mean((q0_res - q_target)**2)
+                q1_loss = 0.5 * torch.mean((q1_res - q_target)**2)
+                v_loss = 0.5 * torch.mean((v_res - v_target)**2)
                 qv_loss = q0_loss + q1_loss + v_loss
-                pi_loss = -torch.mean(q0_fresh_res + entropy_bonus)  # gradient ascent -> descent
+                pi_loss = -torch.mean(q0_fresh_res - entropy_bonus)
 
                 qv_optimizer.zero_grad()
                 qv_loss.backward()
@@ -186,6 +187,10 @@ def test(args):
     agent.test(render=True)
 
 
+def fork_train(args):
+    mp.spawn(train, args=(args,), nprocs=args.ncpu)
+
+
 def main():
     '''
     spinup.sac(env_fn, actor_critic=<function mlp_actor_critic>, ac_kwargs={}, seed=0,
@@ -202,18 +207,19 @@ def main():
         test(args)
     else:
         if args.remote:
-            name = '-'.join([*args.exp_name.split('_'), str(args.seed)])
+            name = '-'.join([*args.exp_name.split('_')])
             meta.call(
                 backend=args.backend,
-                fn=train,
-                kwargs=dict(args=args),
+                fn=mp.spawn,
+                kwargs=dict(fn=train, args=args, nprocs=args.ncpu),
                 log_relpath=name,
                 job_name=name,
                 update=args.update,
                 num_gpu=0,
+                num_cpu=args.ncpu,
             )
         else:
-            train(args)
+            fork_train(args)
 
 
 if __name__ == "__main__":

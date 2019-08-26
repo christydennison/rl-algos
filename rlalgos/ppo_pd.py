@@ -2,6 +2,7 @@ import torch
 import time
 import gym
 import numpy as np
+import safexp.envs  # noqa
 from rlalgos.base import *
 from rcall import meta
 
@@ -43,45 +44,20 @@ def compute_advantage(args, v_s_res, v_sp_res, rewards):
     return adv_unscaled #adv_unit_scaled
 
 
-def kl_divergence(mu_0, mu_1, log_std0, log_std1):
-    std0 = log_std0.exp()
-    std1 = log_std1.exp()
-    return torch.mean(0.5 * ( log_std1 - log_std0 + ((mu_1 - mu_0)**2 + std0)/(std1 + 1e-8) - 1 ))
-
-
-def normalize(tensor):
-    mu = tensor.mean()
-    std = tensor.std()
-    return (tensor - mu)/(std + 1e-8)
-
-
-class GradLogger():
-    def __init__(self):
-        self.epoch_logs = collections.defaultdict(lambda: collections.defaultdict(list)) # {epoch => {var_name: [grad, grad, grad]}}
-        self.epoch = 0
-
-    def set_current_epoch(self, epoch):
-        self.epoch = epoch
-
-    def add(self, name, grad):
-        self.epoch_logs[self.epoch][name].append(grad)
-
-    def get_norms(self, epoch, name):
-        return torch.norm(torch.cat(self.epoch_logs[epoch][name])).item()
-
-
 def train(args):
+    import safexp.envs  # noqa
     env, test_env, act_limit, obs_dim, act_dim = train_base(args)
 
     v = Net(obs_dim, [1], activation=torch.nn.Tanh)
     c = Net(obs_dim, [1], activation=torch.nn.Tanh)
-    c_threshold = 1.0
-    alpha = SoftVar()
+    alpha = MinVar((1,))
+    # alpha = SoftVar((1,))
     pi = Net(obs_dim, [act_dim, act_dim], activation=torch.nn.Tanh)
     pi_prev = Net(obs_dim, [act_dim, act_dim], activation=torch.nn.Tanh)
     pi_prev.load_state_dict(pi.state_dict())
     pi_prev.eval()
     grad_logger = GradLogger()
+    rank = get_rank()
 
     def curried_act(obs, random=False, deterministic=False):
         if random:
@@ -93,15 +69,13 @@ def train(args):
     log = DataLogger(logfile, args)
 
     start = time.time()
-    v_mse_loss = torch.nn.MSELoss()
-    c_mse_loss = torch.nn.MSELoss()
     pi_optimizer = torch.optim.Adam(pi.parameters(), lr=args.pi_lr)
     v_optimizer = torch.optim.Adam(v.parameters(), lr=args.vf_lr)
     c_optimizer = torch.optim.Adam(c.parameters(), lr=args.vf_lr)
-    a_optimizer = torch.optim.Adam(alpha.parameters(), lr=args.vf_lr)
+    a_optimizer = torch.optim.Adam(alpha.parameters(), lr=args.alpha_lr)
 
     for epoch in range(args.epochs):
-        print(f"--------Epoch {epoch}--------")
+        rank_print(rank, f"--------Epoch {epoch}--------")
         step = 0
         epoch_rews = []
         epoch_costs = []
@@ -139,6 +113,9 @@ def train(args):
         v_s_res = v(obs)
         v_sp_res = v(obs_sp)
 
+        c_s_res = c(obs)
+        c_sp_res = c(obs_sp)
+
         # loop over lengths and slice so we only do 1 FP with v_s/v_sp
         adv_unscaled = []
         adv_c_unscaled = []
@@ -160,10 +137,6 @@ def train(args):
         g[adv >= 0] *= (1 + args.clip_ratio)
         g[adv < 0] *= (1 - args.clip_ratio)
 
-        # g_c = adv_c.clone()
-        # g[adv_c >= 0] *= (1 + args.clip_ratio)
-        # g[adv_c < 0] *= (1 - args.clip_ratio)
-
         _, _, pi_prev_mus, pi_prev_log_stds = act(pi_prev, act_limit, obs)
         pi_prev_log_probs = log_probs
 
@@ -177,21 +150,23 @@ def train(args):
             min_std = torch.min(pi_log_stds)
 
             # break early if kl > target_kl
-            
             with torch.no_grad():
-                kl = kl_divergence(pi_prev_log_stds, pi_log_stds, pi_prev_mus, pi_mus)
-            if kl > args.target_kl * 1.5:
-                print(f"Breaking early at optimization step {i_train} with KL div {kl}")
+                kl = gaussian_kl_divergence(pi_prev_log_stds, pi_log_stds, pi_prev_mus, pi_mus)
+            if mpi_avg(kl) > args.target_kl * 1.5:
+                rank_print(rank, f"Breaking early at optimization step {i_train} with KL div {kl}")
                 break
 
             ratio = torch.exp(pi_log_probs - pi_prev_log_probs)
             entropy.append(-pi_log_probs.detach().numpy())
 
             # train pi with advantages pre-calculated
-            pi_loss = -torch.mean(torch.min(adv * ratio, g))  # ascent -> descent
+            pi_pre_loss = torch.min(adv * ratio, g)
+            constraint_loss = alpha() * ratio * adv_c
+            pi_loss = -torch.mean(pi_pre_loss - constraint_loss)/(1 + alpha())  # ascent -> descent
 
             pi_optimizer.zero_grad()
             pi_loss.backward()
+            average_gradients(pi)
             pi_optimizer.step()
             pi_losses.append(pi_loss.clone().detach())
 
@@ -204,6 +179,7 @@ def train(args):
 
             v_optimizer.zero_grad()
             v_loss.backward()
+            average_gradients(v)
             v_optimizer.step()
             v_losses.append(v_loss.clone().detach())
 
@@ -216,23 +192,20 @@ def train(args):
 
             c_optimizer.zero_grad()
             c_loss.backward()
+            average_gradients(c)
             c_optimizer.step()
             c_losses.append(c_loss.clone().detach())
 
 
-        for i_train in range(args.train_iters):
+        a_loss = torch.mean(alpha() * (costs - args.cost_threshold))
 
-            a_loss = torch.mean(alpha * (pi_prev_log_probs * adv_c - c_threshold))
-
-            a_optimizer.zero_grad()
-            a_loss.baakward()
-            a_optimizer.step()
-            a_losses.append(a_loss.clone().detach())
+        a_optimizer.zero_grad()
+        a_loss.backward()
+        a_optimizer.step()
+        alpha.check()
+        a_losses.append(a_loss.clone().detach())
 
         
-        # optimize alpha cost with surrogate cost function approximator (use cost advantage and plug into normal loss)
-
-
         # set to optimized pi's params at end of optimization
         pi_prev.load_state_dict(pi.state_dict())
 
@@ -240,6 +213,7 @@ def train(args):
         ep_cost = np.array(epoch_costs)
         ep_pi_losses = np.array(pi_losses)
         ep_v_losses = np.array(v_losses)
+        ep_a_losses = np.array(a_losses)
         ep_lens_mean = np.array(ep_lens)
         ep_step_ranges = np.array(step_ranges)
         ep_lens_test = []
@@ -265,6 +239,8 @@ def train(args):
         log.log_tabular("TestEpLen", np.array(ep_lens_test).mean())
         log.log_tabular("PiLoss", ep_pi_losses.mean() if len(ep_pi_losses) > 0 else 0)
         log.log_tabular("VLoss", ep_v_losses.mean())
+        log.log_tabular("ALoss", ep_a_losses.mean())
+        log.log_tabular("A", alpha().item())
         log.log_tabular("PiLogStdMax", max_std.item())
         log.log_tabular("PiLogStdMin", min_std.item())
         log.log_tabular("Entropy", ep_entropy.mean())
@@ -273,7 +249,8 @@ def train(args):
         log.log_tabular("Epoch", epoch)
         log.dump_tabular()
 
-        torch.save(pi, paramsfile)
+        if rank == 0:
+            torch.save(pi, paramsfile)
     agent.done()
 
 
@@ -302,6 +279,8 @@ def main():
     parser = base_argparser()
     parser.add_argument("--pi_lr", type=float, default=0.0003)
     parser.add_argument("--vf_lr", type=float, default=0.001)
+    parser.add_argument("--alpha_lr", type=float, default=0.0001)
+    parser.add_argument("--cost_threshold", type=float, default=0.0)
     parser.add_argument("--train_iters", type=int, default=80)
     parser.add_argument("--clip_ratio", type=float, default=0.2)
     parser.add_argument("--lam", type=float, default=0.97)
@@ -315,7 +294,7 @@ def main():
         test(args)
     else:
         if args.remote:
-            name = '-'.join([*args.exp_name.split('_'), str(args.seed)])
+            name = '-'.join([*args.exp_name.split('_')])
             meta.call(
                 backend=args.backend,
                 fn=train,
@@ -324,8 +303,12 @@ def main():
                 job_name=name,
                 update=args.update,
                 num_gpu=0,
+                num_cpu=args.ncpu,
+                mpi_proc_per_machine=int(args.ncpu//4),
+                mpi_machines=1,
             )
         else:
+            mpi_fork(args.ncpu)
             train(args)
 
 

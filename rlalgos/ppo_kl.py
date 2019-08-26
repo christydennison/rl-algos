@@ -47,6 +47,12 @@ def compute_advantage(args, v_s_res, v_sp_res, rewards):
     return adv_unscaled
 
 
+def wrong_kl_divergence(mu_0, mu_1, log_std0, log_std1):
+    std0 = log_std0.exp()
+    std1 = log_std1.exp()
+    return torch.mean(0.5 * ( log_std1 - log_std0 + ((mu_1 - mu_0)**2 + std0)/(std1 + 1e-8) - 1 ))
+
+
 class GradLogger():
     def __init__(self):
         self.epoch_logs = collections.defaultdict(lambda: collections.defaultdict(list)) # {epoch => {var_name: [grad, grad, grad]}}
@@ -71,7 +77,6 @@ def train(args):
     pi_prev.load_state_dict(pi.state_dict())
     pi_prev.eval()
     grad_logger = GradLogger()
-    rank = get_rank()
 
     def curried_act(obs, random=False, deterministic=False):
         if random:
@@ -80,25 +85,43 @@ def train(args):
 
     agent = Agent(args, env, test_env, curried_act)
     logfile, paramsfile = get_filenames(args)
-    log = DataLogger(logfile, args, rank)
+    log = DataLogger(logfile, args)
 
     start = time.time()
     pi_optimizer = torch.optim.Adam(pi.parameters(), lr=args.pi_lr)
     v_optimizer = torch.optim.Adam(v.parameters(), lr=args.vf_lr)
 
     for epoch in range(args.epochs):
-        rank_print(rank, f"--------Epoch {epoch}--------")
+        print(f"--------Epoch {epoch}--------")
         step = 0
+        epoch_rews = []
+        trajectories = []
         pi_losses = []
         v_losses = []
         act_mean = []
+        ep_lens = []
         step_ranges = []
         max_std = 0
         min_std = 0
         entropy = []
+        wrong_kl = []
+        correct_kl = []
+        approx_kl = []
         grad_logger.set_current_epoch(epoch)
 
-        trajectories, ep_lens, obs, obs_sp, actions, rewards, costs, log_probs = agent.run_trajectories()
+        while step < args.steps_per_epoch:
+            traj_steps, ep_rew, _ = agent.run_trajectory()
+            epoch_rews.append(ep_rew)
+            ep_lens.append(traj_steps)
+            step += traj_steps
+            trajectories.append(agent.replay_buffer.get())
+            agent.replay_buffer.clear()
+
+        obs = torch.cat([traj.s for traj in trajectories])
+        obs_sp = torch.cat([traj.sp for traj in trajectories])
+        actions = torch.cat([traj.actions for traj in trajectories])
+        rewards = torch.cat([traj.rewards for traj in trajectories])
+        log_probs = torch.cat([traj.log_probs for traj in trajectories])
         rtg = torch.cat([reward_to_go(args, traj.rewards) for traj in trajectories])
 
         v_s_res = v(obs)
@@ -135,9 +158,11 @@ def train(args):
             # break early if kl > target_kl
             with torch.no_grad():
                 kl = gaussian_kl_divergence(pi_prev_log_stds, pi_log_stds, pi_prev_mus, pi_mus)
-
-            if mpi_avg(kl) > args.target_kl * 1.5:
-                rank_print(rank, f"Breaking early at optimization step {i_train} with KL div {kl}")
+                correct_kl.append(kl.item())
+                wrong_kl.append(wrong_kl_divergence(pi_prev_log_stds, pi_log_stds, pi_prev_mus, pi_mus).item())
+                approx_kl.append(torch.mean(pi_prev_log_probs - pi_log_probs).item())
+            if kl > args.target_kl * 1.5:
+                print(f"Breaking early at optimization step {i_train} with KL div {kl}")
                 break
 
             ratio = torch.exp(pi_log_probs - pi_prev_log_probs)
@@ -148,7 +173,6 @@ def train(args):
 
             pi_optimizer.zero_grad()
             pi_loss.backward()
-            average_gradients(pi)
             pi_optimizer.step()
             pi_losses.append(pi_loss.clone().detach())
 
@@ -161,17 +185,16 @@ def train(args):
 
             v_optimizer.zero_grad()
             v_loss.backward()
-            average_gradients(v)
             v_optimizer.step()
             v_losses.append(v_loss.clone().detach())
-
 
         # set to optimized pi's params at end of optimization
         pi_prev.load_state_dict(pi.state_dict())
 
-
+        ep_rew = np.array(epoch_rews)
         ep_pi_losses = np.array(pi_losses)
         ep_v_losses = np.array(v_losses)
+        ep_lens_mean = np.array(ep_lens)
         ep_step_ranges = np.array(step_ranges)
         ep_lens_test = []
         ep_rew_test = []
@@ -183,25 +206,27 @@ def train(args):
             ep_rew_test.append(test_ep_rew)
 
         log.log_tabular("ExpName", args.exp_name)
-        log.log_tabular("AverageReturn", rewards.mean().item())
+        log.log_tabular("AverageReturn", ep_rew.mean())
         log.log_tabular("TestReturn", np.array(ep_rew_test).mean())
-        log.log_tabular("MaxReturn", rewards.max().item())
-        log.log_tabular("MinReturn", rewards.min().item())
-        log.log_tabular("StdReturn", rewards.std().item())
-        log.log_tabular("AverageEpLen", ep_lens.mean())
+        log.log_tabular("MaxReturn", ep_rew.max())
+        log.log_tabular("MinReturn", ep_rew.min())
+        log.log_tabular("StdReturn", ep_rew.std())
+        log.log_tabular("AverageEpLen", ep_lens_mean.mean())
         log.log_tabular("TestEpLen", np.array(ep_lens_test).mean())
         log.log_tabular("PiLoss", ep_pi_losses.mean() if len(ep_pi_losses) > 0 else 0)
         log.log_tabular("VLoss", ep_v_losses.mean())
         log.log_tabular("PiLogStdMax", max_std.item())
         log.log_tabular("PiLogStdMin", min_std.item())
         log.log_tabular("Entropy", ep_entropy.mean())
+        log.log_tabular("CorrectKL", np.array(correct_kl).mean())
+        log.log_tabular("WrongKL", np.array(wrong_kl).mean())
+        log.log_tabular("ApproxKL", np.array(approx_kl).mean())
         log.log_tabular("Time", time.time() - start)
         log.log_tabular("Steps", step * (1 + epoch))
         log.log_tabular("Epoch", epoch)
         log.dump_tabular()
 
-        if rank == 0:
-            torch.save(pi, paramsfile)
+        torch.save(pi, paramsfile)
     agent.done()
 
 
@@ -243,7 +268,7 @@ def main():
         test(args)
     else:
         if args.remote:
-            name = '-'.join([*args.exp_name.split('_')])
+            name = '-'.join([*args.exp_name.split('_'), str(args.seed)])
             meta.call(
                 backend=args.backend,
                 fn=train,
@@ -252,12 +277,8 @@ def main():
                 job_name=name,
                 update=args.update,
                 num_gpu=0,
-                num_cpu=args.ncpu,
-                mpi_proc_per_machine=int(args.ncpu//4),
-                mpi_machines=1,
             )
         else:
-            mpi_fork(args.ncpu)
             train(args)
 
 
