@@ -135,9 +135,9 @@ def train(args):
             # break early if kl > target_kl
             with torch.no_grad():
                 kl = gaussian_kl_divergence(pi_prev_log_stds, pi_log_stds, pi_prev_mus, pi_mus)
-
-            if mpi_avg(kl) > args.target_kl * 1.5:
-                rank_print(rank, f"Breaking early at optimization step {i_train} with KL div {kl}")
+            ave_kl = mpi_avg(kl)
+            if ave_kl > args.target_kl * 1.5:
+                rank_print(rank, f"Breaking early at optimization step {i_train} with KL div {ave_kl}")
                 break
 
             ratio = torch.exp(pi_log_probs - pi_prev_log_probs)

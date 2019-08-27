@@ -30,8 +30,8 @@ def act(pi, act_limit, obs, deterministic=False):
         log_prob = torch.tensor([0.0]).float()  # 50%
     return act_limit * sample, log_prob, torch.tanh(mu), torch.tanh(log_std)
 
-def train(index, args):
-    env, test_env, act_limit, obs_dim, act_dim = train_base(args, index=index)
+def train(args):
+    env, test_env, act_limit, obs_dim, act_dim = train_base(args, index=0)
 
     q0 = Net(obs_dim + act_dim, [1])
     q1 = Net(obs_dim + act_dim, [1])
@@ -48,7 +48,7 @@ def train(index, args):
 
     agent = Agent(args, env, test_env, curried_act)
     logfile, paramsfile = get_filenames(args)
-    log = DataLogger(logfile, args, index)
+    log = DataLogger(logfile, args, rank=0)
 
     start = time.time()
     # q0_optimizer = torch.optim.Adam(q0.parameters(), lr=args.lr)
@@ -58,7 +58,7 @@ def train(index, args):
     pi_optimizer = torch.optim.Adam(pi.parameters(), lr=args.lr)
 
     for epoch in range(args.epochs):
-        rank_print(index, f"--------Epoch {epoch}--------")
+        print(f"--------Epoch {epoch}--------")
         step = 0
         epoch_rews = []
         entropy_bonuses = []
@@ -187,10 +187,6 @@ def test(args):
     agent.test(render=True)
 
 
-def fork_train(args):
-    mp.spawn(train, args=(args,), nprocs=args.ncpu)
-
-
 def main():
     '''
     spinup.sac(env_fn, actor_critic=<function mlp_actor_critic>, ac_kwargs={}, seed=0,
@@ -217,10 +213,9 @@ def main():
                 update=args.update,
                 num_gpu=0,
                 num_cpu=args.ncpu,
-                mpi_proc_per_machine=int(args.ncpu//4),
             )
         else:
-            fork_train(args)
+            train(args)
 
 
 if __name__ == "__main__":
