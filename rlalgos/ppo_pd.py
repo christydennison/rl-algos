@@ -51,7 +51,7 @@ def train(args):
 
     v = Net(obs_dim, [1], activation=torch.nn.Tanh)
     c = Net(obs_dim, [1], activation=torch.nn.Tanh)
-    alpha = MinVar((1,))
+    alpha = MinVar((1,), fill_value=args.alpha_start)
     # alpha = SoftVar((1,))
     pi = Net(obs_dim, [act_dim, act_dim], activation=torch.nn.Tanh)
     pi_prev = Net(obs_dim, [act_dim, act_dim], activation=torch.nn.Tanh)
@@ -228,6 +228,12 @@ def train(args):
             ep_lens_test.append(test_ep_len)
             ep_rew_test.append(test_ep_rew)
             ep_cost_test.append(test_ep_cost)
+        try:
+            agent.test(render=True)
+            print(f"Act dim: {act_dim}, act_limit {act_limit}")
+            print(actions[:10])
+        except:
+            pass
 
         log.log_tabular("ExpName", args.exp_name)
         log.log_tabular("AverageReturn", ep_rew.mean())
@@ -257,18 +263,15 @@ def train(args):
 
 
 def test(args):
-    env = gym.make(args.env_name)
-    test_env = gym.make(args.env_name)
-    obs_dim = env.observation_space.shape[0]
-    act_dim = env.action_space.shape[0]
-    act_limit = env.action_space.high[0]
-    pi = Net(obs_dim, [act_dim, act_dim])  ## mean and std output
-    pi.eval()
+    env, test_env, act_limit, obs_dim, act_dim = train_base(args)
+    pi = Net(obs_dim, [act_dim, act_dim], activation=torch.nn.Tanh)
+
+    def curried_act(obs, random=False, deterministic=True):
+        return act(pi, act_limit, torch.tensor(obs).float(), deterministic=True)
+
+    agent = Agent(args, env, test_env, curried_act)
     _, paramsfile = get_filenames(args)
     torch.load(paramsfile)
-    def curried_act(obs, random, deterministic):
-        return act(pi, act_limit, torch.tensor(obs).float(), deterministic=True)
-    agent = Agent(args, env, test_env, curried_act)
     agent.test(render=True)
 
 
@@ -282,6 +285,7 @@ def main():
     parser.add_argument("--pi_lr", type=float, default=0.0003)
     parser.add_argument("--vf_lr", type=float, default=0.001)
     parser.add_argument("--alpha_lr", type=float, default=0.0001)
+    parser.add_argument("--alpha_start", type=float, default=0.0)
     parser.add_argument("--cost_threshold", type=float, default=0.0)
     parser.add_argument("--train_iters", type=int, default=80)
     parser.add_argument("--clip_ratio", type=float, default=0.2)

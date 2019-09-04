@@ -14,6 +14,9 @@ def plot(args):
     g.fig.subplots_adjust(top=0.9)
     g.fig.suptitle(args.title)
 
+    if args.ylabel is not None:
+        g.set_ylabels(args.ylabel)
+
     # replace labels
     if args.labels is not None and len(args.labels) > 0:
         for t, l in zip(g._legend.texts, [""] + args.labels): t.set_text(l)
@@ -28,6 +31,7 @@ if __name__ == "__main__":
     parser.add_argument("--filenames", nargs='*')
     parser.add_argument("--savefile", type=str)
     parser.add_argument("--labels", nargs='*')
+    parser.add_argument("--ylabel", type=str)
     parser.add_argument("--title", type=str)
     parser.add_argument("--key", type=str, default="AverageReturn")
     parsed_args = parser.parse_args()

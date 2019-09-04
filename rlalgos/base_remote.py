@@ -8,6 +8,8 @@ import random
 import numpy as np
 from mpi4py import MPI
 from torch.multiprocessing import Process
+from rcall import meta, settings
+from tensorflow.io import gfile
 
 
 LOG_STD_MAX = 2
@@ -262,8 +264,8 @@ class Agent():
         return steps, total_reward, total_cost
 
     def done(self):
-        if get_rank() == 0:
-            self.test(render=True)
+        # if get_rank() == 0:
+        #     self.test(render=True)
         self.env.close()
         sys.exit()
 
@@ -273,8 +275,8 @@ class DataLogger():
     def __init__(self, filename, args, rank=None):
         self.filename = filename
         self.unsaved = {}
-        self.rank = get_rank() if rank is None else rank
-        self.use_headers = (self.rank == 0)
+        self.rank = rank if rank is not None else get_rank()
+        self.use_headers = (rank == 0)
         self.index_key = 'Epoch'
         self.args = args
         self.print_count = 0
@@ -290,7 +292,11 @@ class DataLogger():
             else:
                 print(df.round(3).to_string().split("\n")[1], flush=True)
         self.print_count += 1
-        df.to_csv(self.filename, sep='\t', mode='a', header=self.use_headers)
+        if self.args.backend == 'local':
+            df.to_csv(self.filename, sep='\t', mode='a', header=self.use_headers)
+        else:
+            with gfile.GFile(self.filename, 'a') as f:
+                df.to_csv(f, sep='\t', mode='a', header=self.use_headers)
         self.unsaved = {}
         self.use_headers = False
 
@@ -317,6 +323,13 @@ def normalize(tensor):
     mu = tensor.mean()
     std = tensor.std()
     return (tensor - mu) / (std + 1e-8)
+
+
+def get_gce_output_path(run_id, i):
+    # where to put results in gcs
+    conf = settings.load()
+    name = '-'.join([*run_id.split('_')])
+    return f"gs://{conf.GS_BUCKET}/results/{run_id}/rcall"
 
 
 def gaussian_kl_divergence(mu_0, mu_1, log_std0, log_std1):
@@ -366,9 +379,14 @@ def print_grad(var, var_name, logger):
 
 
 def get_filenames(args):
-    module_root = os.path.dirname(os.path.realpath(__file__))
-    logfile = os.path.join(module_root, args.dir, f"{args.exp_name}_data.csv")
-    paramsfile = os.path.join(module_root, args.dir, f"{args.exp_name}_params.mdl")
+    if args.backend == 'local':
+        module_root = os.path.dirname(os.path.realpath(__file__))
+        logfile = os.path.join(module_root, args.dir, f"{args.exp_name}_data.csv")
+        paramsfile = os.path.join(module_root, args.dir, f"{args.exp_name}_params.mdl")
+    else:
+        output_path = get_gce_output_path(args.exp_name, get_rank())
+        logfile = os.path.join(output_path, "data.csv")
+        paramsfile = os.path.join(output_path, "params.mdl")
     if args.clear:
         if os.path.exists(logfile):
             os.remove(logfile)
