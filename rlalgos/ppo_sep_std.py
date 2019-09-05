@@ -26,32 +26,6 @@ def act(pi, act_limit, obs, deterministic=False, grad_logger=None):
     return act_limit * sample, log_prob, mu, log_std
 
 
-def cumulative_sum(data, discount):
-    discounts = torch.tensor([discount**i for i in range(data.shape[0])])
-    discounted = []
-    for t in range(len(data)):
-        to_end = data[t:]
-        discount_slice = discounts[:len(to_end)].unsqueeze(1)
-        discounted.append(torch.sum(discount_slice * to_end))
-    return torch.tensor(discounted).unsqueeze(1)
-
-
-def reward_to_go(args, rewards):
-    return cumulative_sum(rewards, args.gamma)
-
-
-def compute_advantage(args, v_s_res, v_sp_res, rewards):
-    delta = rewards + args.gamma * v_sp_res - v_s_res
-    adv_unscaled = cumulative_sum(delta, args.gamma * args.lam)
-    return adv_unscaled
-
-
-def kl_divergence(mu_0, mu_1, log_std0, log_std1):
-    std0 = log_std0.exp()
-    std1 = log_std1.exp()
-    return torch.mean(0.5 * ( log_std1 - log_std0 + ((mu_1 - mu_0)**2 + std0)/(std1 + 1e-8) - 1 ))
-
-
 class GradLogger():
     def __init__(self):
         self.epoch_logs = collections.defaultdict(lambda: collections.defaultdict(list)) # {epoch => {var_name: [grad, grad, grad]}}
@@ -71,11 +45,12 @@ def train(args):
     env, test_env, act_limit, obs_dim, act_dim = train_base(args)
 
     v = Net(obs_dim, [1], activation=torch.nn.Tanh)
-    pi = NetWithVar(obs_dim, [act_dim], act_dim, activation=torch.nn.Tanh)
-    pi_prev = NetWithVar(obs_dim, [act_dim], act_dim, activation=torch.nn.Tanh)
+    pi = NetWithVar(obs_dim, [act_dim], (act_dim,), activation=torch.nn.Tanh)
+    pi_prev = NetWithVar(obs_dim, [act_dim], (act_dim,), activation=torch.nn.Tanh)
     pi_prev.load_state_dict(pi.state_dict())
     pi_prev.eval()
     grad_logger = GradLogger()
+    rank = get_rank()
 
     def curried_act(obs, random=False, deterministic=False):
         if random:
@@ -84,42 +59,27 @@ def train(args):
 
     agent = Agent(args, env, test_env, curried_act)
     logfile, paramsfile = get_filenames(args)
-    log = DataLogger(logfile, args)
+    log = DataLogger(logfile, args, rank)
 
     start = time.time()
-    v_mse_loss = torch.nn.MSELoss()
     pi_optimizer = torch.optim.Adam(pi.parameters(), lr=args.pi_lr)
     v_optimizer = torch.optim.Adam(v.parameters(), lr=args.vf_lr)
 
+    step = 0
     for epoch in range(args.epochs):
-        print(f"--------Epoch {epoch}--------")
-        step = 0
-        epoch_rews = []
-        trajectories = []
+        rank_print(rank, f"--------Epoch {epoch}--------")
         pi_losses = []
         v_losses = []
         act_mean = []
-        ep_lens = []
         step_ranges = []
         max_std = 0
         min_std = 0
         entropy = []
         grad_logger.set_current_epoch(epoch)
 
-        while step < args.steps_per_epoch:
-            traj_steps, ep_rew, _ = agent.run_trajectory()
-            epoch_rews.append(ep_rew)
-            ep_lens.append(traj_steps)
-            step += traj_steps
-            trajectories.append(agent.replay_buffer.get())
-            agent.replay_buffer.clear()
-
-        obs = torch.cat([traj.s for traj in trajectories])
-        obs_sp = torch.cat([traj.sp for traj in trajectories])
-        actions = torch.cat([traj.actions for traj in trajectories])
-        rewards = torch.cat([traj.rewards for traj in trajectories])
-        log_probs = torch.cat([traj.log_probs for traj in trajectories])
-        rtg = torch.cat([reward_to_go(args, traj.rewards) for traj in trajectories])
+        trajectories, ep_lens, obs, obs_sp, actions, rewards, costs, log_probs = agent.run_trajectories()
+        rtg = torch.cat([cumulative_sum(traj.rewards, args.gamma) for traj in trajectories])
+        step += ep_lens.sum()
 
         v_s_res = v(obs)
         v_sp_res = v(obs_sp)
@@ -135,10 +95,7 @@ def train(args):
             adv_unscaled.append(adv_tau)
             traj_index += traj_len
 
-        adv_unscaled = torch.cat(adv_unscaled)
-        adv_mean = adv_unscaled.mean()
-        adv_std = adv_unscaled.std()
-        adv = (adv_unscaled - adv_mean) / (adv_std + 1e-8)
+        adv = normalize(torch.cat(adv_unscaled))
         g = adv.clone()
         g[adv >= 0] *= (1 + args.clip_ratio)
         g[adv < 0] *= (1 - args.clip_ratio)
@@ -156,11 +113,11 @@ def train(args):
             min_std = torch.min(pi_log_stds)
 
             # break early if kl > target_kl
-            
             with torch.no_grad():
-                kl = kl_divergence(pi_prev_log_stds, pi_log_stds, pi_prev_mus, pi_mus)
-            if kl > args.target_kl * 1.5:
-                print(f"Breaking early at optimization step {i_train} with KL div {kl}")
+                kl = gaussian_kl_divergence(pi_prev_log_stds, pi_log_stds, pi_prev_mus, pi_mus)
+            ave_kl = mpi_avg(kl)
+            if ave_kl > args.target_kl * 1.5:
+                rank_print(rank, f"Breaking early at optimization step {i_train} with KL div {ave_kl}")
                 break
 
             ratio = torch.exp(pi_log_probs - pi_prev_log_probs)
@@ -171,6 +128,7 @@ def train(args):
 
             pi_optimizer.zero_grad()
             pi_loss.backward()
+            average_gradients(pi)
             pi_optimizer.step()
             pi_losses.append(pi_loss.clone().detach())
 
@@ -179,24 +137,26 @@ def train(args):
 
             # train V with fresh data
             v_s_res = v(obs)
-            v_loss = torch.mean((v_s_res - rtg)**2) #v_mse_loss(v_s_res, rtg) / len(trajectories)
+            v_loss = torch.mean((v_s_res - rtg)**2)
 
             v_optimizer.zero_grad()
             v_loss.backward()
+            average_gradients(v)
             v_optimizer.step()
             v_losses.append(v_loss.clone().detach())
+
 
         # set to optimized pi's params at end of optimization
         pi_prev.load_state_dict(pi.state_dict())
 
-        ep_rew = np.array(epoch_rews)
+
         ep_pi_losses = np.array(pi_losses)
         ep_v_losses = np.array(v_losses)
-        ep_lens_mean = np.array(ep_lens)
         ep_step_ranges = np.array(step_ranges)
         ep_lens_test = []
         ep_rew_test = []
         ep_entropy = np.array(entropy)
+        ep_rews = np.array([traj.rewards.sum() for traj in trajectories])
 
         for _ in range(args.test_iters):
             test_ep_len, test_ep_rew, _ = agent.test(render=False)
@@ -204,12 +164,12 @@ def train(args):
             ep_rew_test.append(test_ep_rew)
 
         log.log_tabular("ExpName", args.exp_name)
-        log.log_tabular("AverageReturn", ep_rew.mean())
+        log.log_tabular("AverageReturn", ep_rews.mean().item())
         log.log_tabular("TestReturn", np.array(ep_rew_test).mean())
-        log.log_tabular("MaxReturn", ep_rew.max())
-        log.log_tabular("MinReturn", ep_rew.min())
-        log.log_tabular("StdReturn", ep_rew.std())
-        log.log_tabular("AverageEpLen", ep_lens_mean.mean())
+        log.log_tabular("MaxReturn", ep_rews.max().item())
+        log.log_tabular("MinReturn", ep_rews.min().item())
+        log.log_tabular("StdReturn", ep_rews.std().item())
+        log.log_tabular("AverageEpLen", ep_lens.mean())
         log.log_tabular("TestEpLen", np.array(ep_lens_test).mean())
         log.log_tabular("PiLoss", ep_pi_losses.mean() if len(ep_pi_losses) > 0 else 0)
         log.log_tabular("VLoss", ep_v_losses.mean())
@@ -217,28 +177,28 @@ def train(args):
         log.log_tabular("PiLogStdMin", min_std.item())
         log.log_tabular("Entropy", ep_entropy.mean())
         log.log_tabular("Time", time.time() - start)
-        log.log_tabular("Steps", step * (1 + epoch))
+        log.log_tabular("Steps", step)
         log.log_tabular("Epoch", epoch)
         log.dump_tabular()
 
-        torch.save(pi, paramsfile)
+        if rank == 0:
+            torch.save(pi, paramsfile)
     agent.done()
 
 
-def test(args):
-    env = gym.make(args.env_name)
-    test_env = gym.make(args.env_name)
-    obs_dim = env.observation_space.shape[0]
-    act_dim = env.action_space.shape[0]
-    act_limit = env.action_space.high[0]
-    pi = Net(obs_dim, [act_dim, act_dim])  ## mean and std output
-    pi.eval()
+
+def test_agent(pi, curried_act, args):
+    env, test_env, act_limit, obs_dim, act_dim = train_base(args)
+    pi = Net(obs_dim, [act_dim, act_dim], activation=torch.nn.Tanh)
+
+    def curried_act(obs, random=False, deterministic=False):
+        return act(pi, act_limit, torch.tensor(obs).float(), deterministic=True)
+
+    agent = Agent(args, env, test_env, curried_act)
     _, paramsfile = get_filenames(args)
     torch.load(paramsfile)
-    def curried_act(obs, random, deterministic):
-        return act(pi, act_limit, torch.tensor(obs).float(), deterministic=True)
-    agent = Agent(args, env, test_env, curried_act)
     agent.test(render=True)
+
 
 
 def main():
@@ -263,7 +223,7 @@ def main():
         test(args)
     else:
         if args.remote:
-            name = '-'.join([*args.exp_name.split('_'), str(args.seed)])
+            name = '-'.join([*args.exp_name.split('_')])
             meta.call(
                 backend=args.backend,
                 fn=train,
@@ -272,8 +232,12 @@ def main():
                 job_name=name,
                 update=args.update,
                 num_gpu=0,
+                num_cpu=16,
+                mpi_proc_per_machine=3,
+                mpi_machines=1,
             )
         else:
+            mpi_fork(args.ncpu)
             train(args)
 
 

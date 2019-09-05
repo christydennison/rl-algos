@@ -111,9 +111,9 @@ class Net(torch.nn.Module):
 
 
 class NetWithVar(Net):
-    def __init__(self, input_size, output_sizes, var_size, hidden_sizes=(400, 300), activation=torch.nn.ReLU, output_activation=None):
+    def __init__(self, input_size, output_sizes, var_size, var_fill_value=-0.5, hidden_sizes=(400, 300), activation=torch.nn.ReLU, output_activation=None):
         super(NetWithVar, self).__init__(input_size, output_sizes, hidden_sizes, activation, output_activation)
-        self.var = torch.nn.Parameter(torch.rand(var_size, dtype=torch.float32, requires_grad=True))
+        self.var = torch.nn.Parameter(torch.full(var_size, fill_value=var_fill_value, dtype=torch.float32, requires_grad=True))
 
     def forward(self, *inp):
         return self.seq(*inp), self.var
@@ -241,8 +241,8 @@ class Agent():
         if record:
             self.test_env = gym.wrappers.Monitor(self.test_env, self.args.dir, force=True)
         observation = self.test_env.reset()
-        total_reward = 0
-        total_cost = 0
+        rewards = []
+        costs = []
         steps = 0
         done = False
         while not(done or steps >= self.max_ep_len):
@@ -253,9 +253,11 @@ class Agent():
                 action, _, _, _ = self.act_fn(observation, random=False, deterministic=True)
 
             observation, reward, done, info = self.test_env.step(action.detach().numpy())
-            total_reward += reward
-            total_cost += info.get('cost', 0)
+            rewards.append(reward)
+            costs.append(info.get('cost', 0))
             steps += 1
+        total_reward = sum(rewards)
+        total_cost = sum(costs)
         if render:
             print(f"Ep Length: {steps}")
             print(f"Ep Reward: {total_reward}")
@@ -265,6 +267,7 @@ class Agent():
         if get_rank() == 0:
             self.test(render=True)
         self.env.close()
+        self.test_env.close()
         sys.exit()
 
 
@@ -317,6 +320,22 @@ def normalize(tensor):
     mu = tensor.mean()
     std = tensor.std()
     return (tensor - mu) / (std + 1e-8)
+
+
+def cumulative_sum(data, discount):
+    discounts = torch.tensor([discount**i for i in range(data.shape[0])])
+    discounted = []
+    for t in range(len(data)):
+        to_end = data[t:]
+        discount_slice = discounts[:len(to_end)].unsqueeze(1)
+        discounted.append(torch.sum(discount_slice * to_end))
+    return torch.tensor(discounted).unsqueeze(1)
+
+
+def compute_advantage(args, v_s_res, v_sp_res, rewards):
+    delta = rewards + args.gamma * v_sp_res - v_s_res
+    adv_unscaled = cumulative_sum(delta, args.gamma * args.lam)
+    return adv_unscaled
 
 
 def gaussian_kl_divergence(mu_0, mu_1, log_std0, log_std1):
@@ -482,7 +501,6 @@ def base_argparser():
     parser.add_argument("--scale_hypers", type=float, default=1.0)
     parser.add_argument("--test_iters", type=int, default=10)
     parser.add_argument("--start_steps", type=int, default=10000)
-    parser.add_argument("--test", action="store_true")
     parser.add_argument("--clear", action="store_true", help="clear out previous logs")
     
     parser.add_argument("--ncpu", type=int, default=1)
@@ -490,6 +508,8 @@ def base_argparser():
     parser.add_argument("--backend", type=str, default=None)
     parser.add_argument("--remote", action="store_true")
     parser.add_argument("--update", action="store_true")
-    parser.add_argument("--trace", action="store_true")
+
+    parser.add_argument("--test", action="store_true")
+    parser.add_argument("--record", action="store_true")
 
     return parser

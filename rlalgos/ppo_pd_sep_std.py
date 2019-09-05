@@ -271,7 +271,7 @@ def test(args):
     agent = Agent(args, env, test_env, curried_act)
     _, paramsfile = get_filenames(args)
     torch.load(paramsfile)
-    agent.test(render=True)
+    agent.test(render=True, record=args.record)
 
 
 def main():

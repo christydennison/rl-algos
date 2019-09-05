@@ -27,26 +27,6 @@ def act(pi, act_limit, obs, deterministic=False, grad_logger=None):
     return act_limit * sample, log_prob, mu, log_std
 
 
-def cumulative_sum(data, discount):
-    discounts = torch.tensor([discount**i for i in range(data.shape[0])])
-    discounted = []
-    for t in range(len(data)):
-        to_end = data[t:]
-        discount_slice = discounts[:len(to_end)].unsqueeze(1)
-        discounted.append(torch.sum(discount_slice * to_end))
-    return torch.tensor(discounted).unsqueeze(1)
-
-
-def reward_to_go(args, rewards):
-    return cumulative_sum(rewards, args.gamma)
-
-
-def compute_advantage(args, v_s_res, v_sp_res, rewards):
-    delta = rewards + args.gamma * v_sp_res - v_s_res
-    adv_unscaled = cumulative_sum(delta, args.gamma * args.lam)
-    return adv_unscaled
-
-
 class GradLogger():
     def __init__(self):
         self.epoch_logs = collections.defaultdict(lambda: collections.defaultdict(list)) # {epoch => {var_name: [grad, grad, grad]}}
@@ -86,20 +66,20 @@ def train(args):
     pi_optimizer = torch.optim.Adam(pi.parameters(), lr=args.pi_lr)
     v_optimizer = torch.optim.Adam(v.parameters(), lr=args.vf_lr)
 
+    step = 0
     for epoch in range(args.epochs):
         rank_print(rank, f"--------Epoch {epoch}--------")
-        step = 0
         pi_losses = []
         v_losses = []
         act_mean = []
-        step_ranges = []
         max_std = 0
         min_std = 0
         entropy = []
         grad_logger.set_current_epoch(epoch)
 
         trajectories, ep_lens, obs, obs_sp, actions, rewards, costs, log_probs = agent.run_trajectories()
-        rtg = torch.cat([reward_to_go(args, traj.rewards) for traj in trajectories])
+        rtg = torch.cat([cumulative_sum(traj.rewards, args.gamma) for traj in trajectories])
+        step += ep_lens.sum()
 
         v_s_res = v(obs)
         v_sp_res = v(obs_sp)
@@ -172,7 +152,6 @@ def train(args):
 
         ep_pi_losses = np.array(pi_losses)
         ep_v_losses = np.array(v_losses)
-        ep_step_ranges = np.array(step_ranges)
         ep_lens_test = []
         ep_rew_test = []
         ep_entropy = np.array(entropy)
@@ -196,7 +175,7 @@ def train(args):
         log.log_tabular("PiLogStdMin", min_std.item())
         log.log_tabular("Entropy", ep_entropy.mean())
         log.log_tabular("Time", time.time() - start)
-        log.log_tabular("Steps", step * (1 + epoch))
+        log.log_tabular("Steps", step)
         log.log_tabular("Epoch", epoch)
         log.dump_tabular()
 
@@ -249,8 +228,8 @@ def main():
                 job_name=name,
                 update=args.update,
                 num_gpu=0,
-                num_cpu=args.ncpu,
-                mpi_proc_per_machine=int(args.ncpu//4),
+                num_cpu=16,
+                mpi_proc_per_machine=3,
                 mpi_machines=1,
             )
         else:

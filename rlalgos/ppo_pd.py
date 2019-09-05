@@ -14,8 +14,7 @@ def gaussian_logprob(action, mu, log_std):
 
 
 def act(pi, act_limit, obs, deterministic=False, grad_logger=None):
-    res = pi(obs)
-    mu, log_std = torch.chunk(res, 2, dim=-1)
+    mu, log_std = pi(obs)
     if not deterministic:
         std = torch.exp(log_std)
         normal_noise = torch.randn_like(mu)
@@ -28,22 +27,6 @@ def act(pi, act_limit, obs, deterministic=False, grad_logger=None):
     return act_limit * sample, log_prob, mu, log_std
 
 
-def cumulative_sum(data, discount):
-    discounts = torch.tensor([discount**i for i in range(data.shape[0])])
-    discounted = []
-    for t in range(len(data)):
-        to_end = data[t:]
-        discount_slice = discounts[:len(to_end)].unsqueeze(1)
-        discounted.append(torch.sum(discount_slice * to_end))
-    return torch.tensor(discounted).unsqueeze(1)
-
-
-def compute_advantage(args, v_s_res, v_sp_res, rewards):
-    delta = rewards + args.gamma * v_sp_res - v_s_res
-    adv_unscaled = cumulative_sum(delta, args.gamma * args.lam)
-    return adv_unscaled #adv_unit_scaled
-
-
 def train(args):
     import safexp.envs
 
@@ -53,8 +36,8 @@ def train(args):
     c = Net(obs_dim, [1], activation=torch.nn.Tanh)
     alpha = MinVar((1,), fill_value=args.alpha_start)
     # alpha = SoftVar((1,))
-    pi = Net(obs_dim, [act_dim, act_dim], activation=torch.nn.Tanh)
-    pi_prev = Net(obs_dim, [act_dim, act_dim], activation=torch.nn.Tanh)
+    pi = NetWithVar(obs_dim, [act_dim], act_dim, activation=torch.nn.Tanh)
+    pi_prev = NetWithVar(obs_dim, [act_dim], act_dim, activation=torch.nn.Tanh)
     pi_prev.load_state_dict(pi.state_dict())
     pi_prev.eval()
     grad_logger = GradLogger()
@@ -75,9 +58,9 @@ def train(args):
     c_optimizer = torch.optim.Adam(c.parameters(), lr=args.vf_lr)
     a_optimizer = torch.optim.Adam(alpha.parameters(), lr=args.alpha_lr)
 
+    step = 0
     for epoch in range(args.epochs):
         rank_print(rank, f"--------Epoch {epoch}--------")
-        step = 0
         epoch_rews = []
         epoch_costs = []
         trajectories = []
@@ -102,14 +85,10 @@ def train(args):
             trajectories.append(agent.replay_buffer.get())
             agent.replay_buffer.clear()
 
-        obs = torch.cat([traj.s for traj in trajectories])
-        obs_sp = torch.cat([traj.sp for traj in trajectories])
-        actions = torch.cat([traj.actions for traj in trajectories])
-        rewards = torch.cat([traj.rewards for traj in trajectories])
-        costs = torch.cat([traj.costs for traj in trajectories])
-        log_probs = torch.cat([traj.log_probs for traj in trajectories])
+        trajectories, ep_lens, obs, obs_sp, actions, rewards, costs, log_probs = agent.run_trajectories()
         rtg = torch.cat([cumulative_sum(traj.rewards, args.gamma) for traj in trajectories])
         ctg = torch.cat([cumulative_sum(traj.costs, args.gamma) for traj in trajectories])
+        step += ep_lens.sum()
 
         v_s_res = v(obs)
         v_sp_res = v(obs_sp)
@@ -144,7 +123,7 @@ def train(args):
 
         for i_train in range(args.train_iters):
 
-            pi_mus, pi_log_stds = torch.chunk(pi(obs), 2, dim=-1)
+            pi_mus, pi_log_stds = pi(obs)
             pi_log_probs = gaussian_logprob(actions/act_limit, pi_mus, pi_log_stds)
 
             max_std = torch.max(pi_log_stds)
@@ -228,12 +207,12 @@ def train(args):
             ep_lens_test.append(test_ep_len)
             ep_rew_test.append(test_ep_rew)
             ep_cost_test.append(test_ep_cost)
-        try:
-            agent.test(render=True)
-            print(f"Act dim: {act_dim}, act_limit {act_limit}")
-            print(actions[:10])
-        except:
-            pass
+        # try:
+        #     agent.test(render=True)
+        #     print(f"Act dim: {act_dim}, act_limit {act_limit}")
+        #     print(actions[:10])
+        # except:
+        #     pass
 
         log.log_tabular("ExpName", args.exp_name)
         log.log_tabular("AverageReturn", ep_rew.mean())
@@ -253,7 +232,7 @@ def train(args):
         log.log_tabular("PiLogStdMin", min_std.item())
         log.log_tabular("Entropy", ep_entropy.mean())
         log.log_tabular("Time", time.time() - start)
-        log.log_tabular("Steps", step * (1 + epoch))
+        log.log_tabular("Steps", step)
         log.log_tabular("Epoch", epoch)
         log.dump_tabular()
 
@@ -309,8 +288,8 @@ def main():
                 job_name=name,
                 update=args.update,
                 num_gpu=0,
-                num_cpu=args.ncpu,
-                mpi_proc_per_machine=int(args.ncpu//4),
+                num_cpu=16,
+                mpi_proc_per_machine=3,
                 mpi_machines=1,
             )
         else:
