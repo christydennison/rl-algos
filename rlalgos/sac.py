@@ -5,7 +5,7 @@ import numpy as np
 from rlalgos.base import *
 from rcall import meta
 import torch.multiprocessing as mp
-
+torch.set_num_threads(4)
 
 LOG_PROB_CONST2 = np.log(2)
 

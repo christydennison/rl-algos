@@ -9,6 +9,8 @@ import numpy as np
 from mpi4py import MPI
 from torch.multiprocessing import Process
 
+pd.set_option('display.max_columns', 500)
+pd.set_option('display.width', 1000)
 
 LOG_STD_MAX = 2
 LOG_STD_MIN = -20
@@ -464,6 +466,19 @@ def average_gradients(model):
         np.divide(buf, size, out=buf)
         param.grad.data = torch.tensor(buf)
 
+
+from functools import wraps
+
+def timed(func):
+    """This decorator prints the execution time for the decorated function."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.time()
+        result = func(*args, **kwargs)
+        end = time.time()
+        print("{} ran in {}s".format(func.__name__, round(end - start, 2)))
+        return result
+    return wrapper
 
 # guess MPI is fast enough within a machine that going param by param isn't much slower (like 10 seconds for a 50 epoch run. srsly.)
 # def average_gradients(model):

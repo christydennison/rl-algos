@@ -4,6 +4,7 @@ import gym
 import numpy as np
 from rlalgos.base import *
 from rcall import meta
+torch.set_num_threads(4)
 
 
 def gaussian_logprob(action, mu, log_std):

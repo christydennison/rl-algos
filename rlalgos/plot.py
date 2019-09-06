@@ -13,8 +13,6 @@ def plot(args):
         g._legend.set_draggable(state=True)
     g.fig.subplots_adjust(top=0.9)
     g.fig.suptitle(args.title)
-    import ipdb; ipdb.set_trace()
-    # g.fig.xlim(0, 100)
 
 
     if args.ylabel is not None:
