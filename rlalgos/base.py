@@ -263,6 +263,7 @@ class Agent():
         if render:
             print(f"Ep Length: {steps}")
             print(f"Ep Reward: {total_reward}")
+            print(f"Ep Cost: {total_cost}")
         return steps, total_reward, total_cost
 
     def done(self):
@@ -386,16 +387,34 @@ def print_grad(var, var_name, logger):
         print(var_name, "not registered because no gradient present!")
 
 
-def get_filenames(args):
+def get_filenames(args, net_names):
     module_root = os.path.dirname(os.path.realpath(__file__))
     logfile = os.path.join(module_root, args.dir, f"{args.exp_name}_data.csv")
-    paramsfile = os.path.join(module_root, args.dir, f"{args.exp_name}_params.mdl")
+    paramsfiles = [os.path.join(module_root, args.dir, f"{args.exp_name}_{net_name}_params.mdl") for net_name in net_names]
     if args.clear:
         if os.path.exists(logfile):
             os.remove(logfile)
-        if os.path.exists(paramsfile):
-            os.remove(paramsfile)
-    return logfile, paramsfile
+        for f in paramsfiles:
+            if os.path.exists(f):
+                os.remove(f)
+    return logfile, paramsfiles
+
+
+def load_saved_models(args, models, filenames):
+    if args.resume:
+        for model, filename in zip(models, filenames):
+            try:
+                model.load_state_dict(torch.load(filename))
+            except:
+                print(f'Unable to load model {filename}')
+
+
+def save_models(models, filenames):
+    for model, filename in zip(models, filenames):
+        try:
+            torch.save(model.state_dict(), filename)
+        except:
+            print(f'Unable to save model {filename}')
 
 
 def scale_hypers(args):
@@ -524,6 +543,7 @@ def base_argparser():
     parser.add_argument("--remote", action="store_true")
     parser.add_argument("--update", action="store_true")
 
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--test", action="store_true")
     parser.add_argument("--record", action="store_true")
 

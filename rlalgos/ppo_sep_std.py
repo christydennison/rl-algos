@@ -4,7 +4,7 @@ import gym
 import numpy as np
 from rlalgos.base import *
 from rcall import meta
-torch.set_num_threads(4)
+torch.set_num_threads(1)
 
 
 def gaussian_logprob(action, mu, log_std):
@@ -59,7 +59,8 @@ def train(args):
         return act(pi, act_limit, torch.tensor(obs).float(), deterministic=deterministic, grad_logger=grad_logger)
 
     agent = Agent(args, env, test_env, curried_act)
-    logfile, paramsfile = get_filenames(args)
+    models = [pi, v]
+    logfile, paramsfile = get_filenames(args, ['pi', 'v'])
     log = DataLogger(logfile, args, rank)
 
     start = time.time()
@@ -165,11 +166,11 @@ def train(args):
             ep_rew_test.append(test_ep_rew)
 
         log.log_tabular("ExpName", args.exp_name)
-        log.log_tabular("AverageReturn", ep_rews.mean().item())
+        log.log_tabular("AverageReturn", ep_rews.mean())
         log.log_tabular("TestReturn", np.array(ep_rew_test).mean())
-        log.log_tabular("MaxReturn", ep_rews.max().item())
-        log.log_tabular("MinReturn", ep_rews.min().item())
-        log.log_tabular("StdReturn", ep_rews.std().item())
+        log.log_tabular("MaxReturn", ep_rews.max())
+        log.log_tabular("MinReturn", ep_rews.min())
+        log.log_tabular("StdReturn", ep_rews.std())
         log.log_tabular("AverageEpLen", ep_lens.mean())
         log.log_tabular("TestEpLen", np.array(ep_lens_test).mean())
         log.log_tabular("PiLoss", ep_pi_losses.mean() if len(ep_pi_losses) > 0 else 0)
@@ -182,8 +183,8 @@ def train(args):
         log.log_tabular("Epoch", epoch)
         log.dump_tabular()
 
-        if rank == 0:
-            torch.save(pi, paramsfile)
+        # if rank == 0:
+        #     torch.save(pi, paramsfile)
     agent.done()
 
 

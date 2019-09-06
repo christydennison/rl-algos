@@ -5,6 +5,7 @@ import numpy as np
 import safexp.envs
 from rlalgos.base import *
 from rcall import meta
+torch.set_num_threads(4)
 
 
 def gaussian_logprob(action, mu, log_std):
@@ -35,9 +36,12 @@ def train(args):
     v = Net(obs_dim, [1], activation=torch.nn.Tanh)
     c = Net(obs_dim, [1], activation=torch.nn.Tanh)
     alpha = MinVar((1,), fill_value=args.alpha_start)
-    # alpha = SoftVar((1,))
-    pi = NetWithVar(obs_dim, [act_dim], act_dim, activation=torch.nn.Tanh)
-    pi_prev = NetWithVar(obs_dim, [act_dim], act_dim, activation=torch.nn.Tanh)
+    pi = NetWithVar(obs_dim, [act_dim], (act_dim,), activation=torch.nn.Tanh)
+    logfile, paramsfiles = get_filenames(args, ['pi', 'v', 'c', 'alpha'])
+    models = [pi, v, c, alpha]
+    load_saved_models(args, models, paramsfiles)
+
+    pi_prev = NetWithVar(obs_dim, [act_dim], (act_dim,), activation=torch.nn.Tanh)
     pi_prev.load_state_dict(pi.state_dict())
     pi_prev.eval()
     grad_logger = GradLogger()
@@ -49,7 +53,7 @@ def train(args):
         return act(pi, act_limit, torch.tensor(obs).float(), deterministic=deterministic, grad_logger=grad_logger)
 
     agent = Agent(args, env, test_env, curried_act)
-    logfile, paramsfile = get_filenames(args)
+
     log = DataLogger(logfile, args)
 
     start = time.time()
@@ -64,7 +68,9 @@ def train(args):
         epoch_rews = []
         epoch_costs = []
         trajectories = []
+        ratios = []
         pi_losses = []
+        constraint_losses = []
         v_losses = []
         c_losses = []
         a_losses = []
@@ -75,15 +81,6 @@ def train(args):
         min_std = 0
         entropy = []
         grad_logger.set_current_epoch(epoch)
-
-        while step < args.steps_per_epoch:
-            traj_steps, ep_rew, ep_cost = agent.run_trajectory()
-            epoch_rews.append(ep_rew)
-            epoch_costs.append(ep_cost)
-            ep_lens.append(traj_steps)
-            step += traj_steps
-            trajectories.append(agent.replay_buffer.get())
-            agent.replay_buffer.clear()
 
         trajectories, ep_lens, obs, obs_sp, actions, rewards, costs, log_probs = agent.run_trajectories()
         rtg = torch.cat([cumulative_sum(traj.rewards, args.gamma) for traj in trajectories])
@@ -150,6 +147,8 @@ def train(args):
             average_gradients(pi)
             pi_optimizer.step()
             pi_losses.append(pi_loss.clone().detach())
+            constraint_losses.append(constraint_loss.mean().clone().detach())
+            ratios.append(ratio.detach().numpy())
 
 
         for i_train in range(args.train_iters):
@@ -192,7 +191,9 @@ def train(args):
 
         ep_rew = np.array(epoch_rews)
         ep_cost = np.array(epoch_costs)
+        ep_ratios = np.array(ratios)
         ep_pi_losses = np.array(pi_losses)
+        ep_c_losses = np.array(constraint_losses)
         ep_v_losses = np.array(v_losses)
         ep_a_losses = np.array(a_losses)
         ep_lens_mean = np.array(ep_lens)
@@ -201,30 +202,36 @@ def train(args):
         ep_rew_test = []
         ep_cost_test = []
         ep_entropy = np.array(entropy)
+        ep_rews = np.array([traj.rewards.sum() for traj in trajectories])
+        ep_costs = np.array([traj.costs.sum() for traj in trajectories])
 
         for _ in range(args.test_iters):
             test_ep_len, test_ep_rew, test_ep_cost = agent.test(render=False)
             ep_lens_test.append(test_ep_len)
             ep_rew_test.append(test_ep_rew)
             ep_cost_test.append(test_ep_cost)
-        # try:
-        #     agent.test(render=True)
-        #     print(f"Act dim: {act_dim}, act_limit {act_limit}")
-        #     print(actions[:10])
-        # except:
-        #     pass
+        # if epoch % 3 == 0:
+        #     try:
+        #         agent.test(render=True)
+        #         print(f"Act dim: {act_dim}, act_limit {act_limit}")
+        #         print(actions[:10])
+        #     except:
+        #         pass
 
         log.log_tabular("ExpName", args.exp_name)
-        log.log_tabular("AverageReturn", ep_rew.mean())
-        log.log_tabular("AverageCost", ep_cost.mean())
+        log.log_tabular("AverageReturn", ep_rews.mean())
+        log.log_tabular("AverageCost", ep_costs.mean())
         log.log_tabular("TestReturn", np.array(ep_rew_test).mean())
         log.log_tabular("TestCost", np.array(ep_cost_test).mean())
-        log.log_tabular("MaxReturn", ep_rew.max())
-        log.log_tabular("MinReturn", ep_rew.min())
-        log.log_tabular("StdReturn", ep_rew.std())
+        log.log_tabular("TestReturn", np.array(ep_rew_test).mean())
+        log.log_tabular("MaxReturn", ep_rews.max())
+        log.log_tabular("MinReturn", ep_rews.min())
+        log.log_tabular("StdReturn", ep_rews.std())
         log.log_tabular("AverageEpLen", ep_lens_mean.mean())
         log.log_tabular("TestEpLen", np.array(ep_lens_test).mean())
+        log.log_tabular("Ratio", ep_ratios.mean() if len(ep_ratios) > 0 else 0)
         log.log_tabular("PiLoss", ep_pi_losses.mean() if len(ep_pi_losses) > 0 else 0)
+        log.log_tabular("ConstraintLoss", ep_c_losses.mean() if len(ep_c_losses) > 0 else 0)
         log.log_tabular("VLoss", ep_v_losses.mean())
         log.log_tabular("ALoss", ep_a_losses.mean())
         log.log_tabular("A", alpha().item())
@@ -237,7 +244,7 @@ def train(args):
         log.dump_tabular()
 
         if rank == 0:
-            torch.save(pi, paramsfile)
+            save_models(models, paramsfiles)
     agent.done()
 
 
@@ -249,8 +256,9 @@ def test(args):
         return act(pi, act_limit, torch.tensor(obs).float(), deterministic=True)
 
     agent = Agent(args, env, test_env, curried_act)
-    _, paramsfile = get_filenames(args)
-    torch.load(paramsfile)
+    _, paramsfiles = get_filenames(args, ['pi', 'v', 'c'])
+    for paramsfile in paramsfiles:
+        torch.load(paramsfile)
     agent.test(render=True)
 
 
@@ -265,7 +273,7 @@ def main():
     parser.add_argument("--vf_lr", type=float, default=0.001)
     parser.add_argument("--alpha_lr", type=float, default=0.0001)
     parser.add_argument("--alpha_start", type=float, default=0.0)
-    parser.add_argument("--cost_threshold", type=float, default=0.0)
+    parser.add_argument("--cost_threshold", type=float, default=25.0)
     parser.add_argument("--train_iters", type=int, default=80)
     parser.add_argument("--clip_ratio", type=float, default=0.2)
     parser.add_argument("--lam", type=float, default=0.97)

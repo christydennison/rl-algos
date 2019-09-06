@@ -156,6 +156,7 @@ def train(args):
         ep_lens_test = []
         ep_rew_test = []
         ep_entropy = np.array(entropy)
+        ep_rews = np.array([traj.rewards.sum() for traj in trajectories])
 
         for _ in range(args.test_iters):
             test_ep_len, test_ep_rew, _ = agent.test(render=False)
@@ -163,11 +164,11 @@ def train(args):
             ep_rew_test.append(test_ep_rew)
 
         log.log_tabular("ExpName", args.exp_name)
-        log.log_tabular("AverageReturn", rewards.mean().item())
+        log.log_tabular("AverageReturn", ep_rews.mean().item())
         log.log_tabular("TestReturn", np.array(ep_rew_test).mean())
-        log.log_tabular("MaxReturn", rewards.max().item())
-        log.log_tabular("MinReturn", rewards.min().item())
-        log.log_tabular("StdReturn", rewards.std().item())
+        log.log_tabular("MaxReturn", ep_rews.max().item())
+        log.log_tabular("MinReturn", ep_rews.min().item())
+        log.log_tabular("StdReturn", ep_rews.std().item())
         log.log_tabular("AverageEpLen", ep_lens.mean())
         log.log_tabular("TestEpLen", np.array(ep_lens_test).mean())
         log.log_tabular("PiLoss", ep_pi_losses.mean() if len(ep_pi_losses) > 0 else 0)
