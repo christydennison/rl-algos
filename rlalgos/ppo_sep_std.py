@@ -4,7 +4,7 @@ import gym
 import numpy as np
 from rlalgos.base import *
 from rcall import meta
-torch.set_num_threads(1)
+torch.set_num_threads(4)
 
 
 def gaussian_logprob(action, mu, log_std):
@@ -116,7 +116,7 @@ def train(args):
 
             # break early if kl > target_kl
             with torch.no_grad():
-                kl = gaussian_kl_divergence(pi_prev_log_stds, pi_log_stds, pi_prev_mus, pi_mus)
+                kl = torch.mean(pi_prev_log_probs - pi_log_probs) #gaussian_kl_divergence(pi_prev_log_stds, pi_log_stds, pi_prev_mus, pi_mus)
             ave_kl = mpi_avg(kl)
             if ave_kl > args.target_kl * 1.5:
                 rank_print(rank, f"Breaking early at optimization step {i_train} with KL div {ave_kl}")
@@ -235,7 +235,7 @@ def main():
                 update=args.update,
                 num_gpu=0,
                 num_cpu=16,
-                mpi_proc_per_machine=3,
+                mpi_proc_per_machine=1,
                 mpi_machines=1,
             )
         else:
